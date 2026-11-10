@@ -1,2 +1,3 @@
 Telethon==1.45.0
 PySocks==1.7.1
+python-socks[asyncio]
