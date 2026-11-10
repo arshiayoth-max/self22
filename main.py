@@ -44,16 +44,7 @@ print("PROXY SECRET LENGTH:", len(PROXY_SECRET))
 client = TelegramClient(
     SESSION_NAME,
     API_ID,
-    API_HASH,
-    connection=connection.ConnectionTcpMTProxyRandomizedIntermediate,
-    proxy=(
-        PROXY_HOST,
-        PROXY_PORT,
-        PROXY_SECRET
-    ),
-    request_retries=3,
-    connection_retries=5,
-    retry_delay=3
+    API_HASH
 )
 
 
