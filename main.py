@@ -15,7 +15,7 @@ from telethon import TelegramClient, events, connection
 # =========================================================
 # 1. TELEGRAM ACCOUNT
 # =========================================================
-
+print("aaaa")
 API_ID = 36006348  # جایگزین کن
 API_HASH = "caa664949252baecd0b18ce3bf589b91"
 
