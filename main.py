@@ -29,18 +29,6 @@ SESSION_NAME = "mafia_auto_manager"
 # =========================================================
 # 2. MTPROTO PROXY
 # =========================================================
-PROXY_HOST = "qadim.zhigool.co.uk"
-PROXY_PORT = 22
-
-PROXY_SECRET_B64 = "EERighJJvXrFGRMCIMJdCQ"
-
-PROXY_SECRET = base64.urlsafe_b64decode(
-    PROXY_SECRET_B64 + "=" * (-len(PROXY_SECRET_B64) % 4)
-).hex()
-
-print("PROXY HOST:", repr(PROXY_HOST))
-print("PROXY PORT:", repr(PROXY_PORT))
-print("PROXY SECRET LENGTH:", len(PROXY_SECRET))
 
 client = TelegramClient(
     SESSION_NAME,
