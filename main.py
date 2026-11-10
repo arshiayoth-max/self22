@@ -7,15 +7,14 @@ import time
 import math
 from datetime import datetime
 from pathlib import Path
-import os
-from telethon.sessions import StringSession
+
 from telethon import TelegramClient, events, connection
 
 
 # =========================================================
 # 1. TELEGRAM ACCOUNT
 # =========================================================
-print("aaaa")
+
 API_ID = 36006348  # جایگزین کن
 API_HASH = "caa664949252baecd0b18ce3bf589b91"
 
@@ -29,6 +28,7 @@ SESSION_NAME = "mafia_auto_manager"
 # =========================================================
 # 2. MTPROTO PROXY
 # =========================================================
+
 
 client = TelegramClient(
     SESSION_NAME,
@@ -2163,24 +2163,35 @@ async def main():
     print("MAFIA EMPIRE AUTO MANAGER")
     print("=" * 50)
 
-    print("Connecting to Telegram...")
+    print("Connecting through MTProto proxy...")
 
-    await client.connect()
-
-    if not await client.is_user_authorized():
-        raise RuntimeError(
-            "Telegram Session is invalid or expired. "
-            "Please generate a new session."
-        )
+    await client.start()
 
     me = await client.get_me()
 
     print("\nCONNECTED SUCCESSFULLY")
     print("Account:", me.first_name)
     print("Username:", me.username)
+    print("Proxy:", PROXY_HOST)
+    print("Port:", PROXY_PORT)
 
     print("=" * 50)
     print("Waiting for group commands...")
     print("=" * 50)
 
     await client.run_until_disconnected()
+
+
+if __name__ == "__main__":
+
+    try:
+
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+
+        print("\nProgram stopped.")
+
+    except Exception as error:
+
+        print("\nFATAL ERROR:", repr(error))
