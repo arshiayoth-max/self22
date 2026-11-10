@@ -1,6 +1,7 @@
 import asyncio
 import json
 import base64
+import os
 import re
 import random
 import time
@@ -9,29 +10,46 @@ from datetime import datetime
 from pathlib import Path
 
 from telethon import TelegramClient, events, connection
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    PasswordHashInvalidError,
+    PhoneNumberInvalidError,
+    FloodWaitError
+)
 
 
 # =========================================================
-# 1. TELEGRAM ACCOUNT
+# 1. TELEGRAM ACCOUNT  (از Environment Variable خوانده می‌شود)
 # =========================================================
 
-API_ID = 36006348  # جایگزین کن
-API_HASH = "caa664949252baecd0b18ce3bf589b91"
+API_ID = int(os.environ["36006348"])
+API_HASH = os.environ["caa664949252baecd0b18ce3bf589b91"]
+BOT_TOKEN = os.environ["8758291446:AAFVi179EV95tJn5PWdkT6FgqJpQISjizAQ"]
+OWNER_ID = int(os.environ["6646045908"])  # آیدی عددی خودت
 
-SESSION_NAME = "mafia_auto_manager"
+# مسیر Volume در Railway
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+SESSION_NAME = str(DATA_DIR / "mafia_auto_manager")
+
 
 # =========================================================
-# 2. MTPROTO PROXY
+# 2. CLIENTS
 # =========================================================
 
-
-# =========================================================
-# 2. MTPROTO PROXY
-# =========================================================
-
-
+# اکانت اصلی (ورود از طریق ربات)
 client = TelegramClient(
     SESSION_NAME,
+    API_ID,
+    API_HASH
+)
+
+# ربات لاگین
+bot = TelegramClient(
+    str(DATA_DIR / "login_bot"),
     API_ID,
     API_HASH
 )
@@ -41,7 +59,7 @@ client = TelegramClient(
 # 3. CONFIGURATION
 # =========================================================
 
-CONFIG_FILE = Path("mafia_settings.json")
+CONFIG_FILE = DATA_DIR / "mafia_settings.json"
 
 DEFAULT_SETTINGS = {
     "product": "نام محصول",
@@ -233,8 +251,8 @@ def get_market_product_price(text, product):
 # 4.1. ADAPTIVE ONLINE PRICE LEARNING
 # =========================================================
 
-PRICE_HISTORY_FILE = Path("mafia_price_history.json")
-PRICE_STATE_FILE = Path("mafia_price_learning_state.json")
+PRICE_HISTORY_FILE = DATA_DIR / "mafia_price_history.json"
+PRICE_STATE_FILE = DATA_DIR / "mafia_price_learning_state.json"
 PRICE_HISTORY_LIMIT = 1000
 PRICE_INTERVAL_SECONDS = 3600
 PRICE_MIN_SAMPLE_GAP = 3300
@@ -1570,7 +1588,7 @@ async def command_handler(event):
 # 12. AUTO BATTLE SYSTEM
 # =========================================================
 
-BATTLE_SETTINGS_FILE = Path("mafia_battle_settings.json")
+BATTLE_SETTINGS_FILE = DATA_DIR / "mafia_battle_settings.json"
 
 battle_settings = {}
 battle_tasks = {}
@@ -2151,7 +2169,203 @@ async def battle_command_handler(event):
 
 
 # =========================================================
-# 13. MAIN
+# 13. TELEGRAM LOGIN BOT  (دریافت شماره و کد از طریق ربات)
+# =========================================================
+
+login = {"step": None, "phone": None, "hash": None}
+
+
+def only_digits(text):
+
+    return re.sub(r"\D", "", normalize_digits(text or ""))
+
+
+async def safe_delete(event):
+
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+
+async def stop_all_tasks():
+
+    for group in (tasks, battle_tasks):
+
+        for task in list(group.values()):
+
+            if not task.done():
+                task.cancel()
+
+
+async def finish_login(event):
+
+    login.update(step=None, phone=None, hash=None)
+
+    await safe_delete(event)  # پاک کردن پیام حاوی کد/رمز
+
+    me = await client.get_me()
+
+    await event.respond(
+        f"✅ وارد شد: {me.first_name}\n"
+        "حالا دستورات (/GO, /HELP, ...) را داخل گروه بزن."
+    )
+
+
+@bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
+async def login_handler(event):
+
+    if event.sender_id != OWNER_ID:
+        return
+
+    text = (event.raw_text or "").strip()
+    step = login["step"]
+
+    # ---------- commands ----------
+
+    if text.lower() in ("/start", "/login"):
+
+        if not client.is_connected():
+            await client.connect()
+
+        if await client.is_user_authorized():
+
+            me = await client.get_me()
+
+            await event.respond(
+                f"✅ اکانت وصل است: {me.first_name}\n"
+                "برای خروج: /logout"
+            )
+
+            return
+
+        login.update(step="phone", phone=None, hash=None)
+
+        await event.respond(
+            "📱 شماره را با کد کشور بفرست.\n"
+            "مثال: +989121234567"
+        )
+
+        return
+
+    if text.lower() == "/logout":
+
+        await stop_all_tasks()
+
+        if client.is_connected() and await client.is_user_authorized():
+            await client.log_out()
+
+        login.update(step=None, phone=None, hash=None)
+
+        await event.respond("🚪 از اکانت خارج شد. برای ورود مجدد: /login")
+
+        return
+
+    if text.lower() == "/status":
+
+        ok = client.is_connected() and await client.is_user_authorized()
+
+        await event.respond("✅ متصل" if ok else "❌ متصل نیست — /login")
+
+        return
+
+    # ---------- phone ----------
+
+    if step == "phone":
+
+        phone = "+" + only_digits(text)
+
+        try:
+
+            if not client.is_connected():
+                await client.connect()
+
+            sent = await client.send_code_request(phone)
+
+        except PhoneNumberInvalidError:
+
+            await event.respond("❌ شماره نامعتبر است. دوباره بفرست.")
+            return
+
+        except FloodWaitError as error:
+
+            await event.respond(
+                f"⏳ تلگرام محدودیت گذاشته. {error.seconds} ثانیه صبر کن."
+            )
+            return
+
+        login.update(step="code", phone=phone, hash=sent.phone_code_hash)
+
+        await event.respond(
+            "📨 کد به تلگرام اکانت ارسال شد.\n\n"
+            "⚠️ کد را با خط تیره یا فاصله بفرست، مثلاً: 1-2-3-4-5\n"
+            "(اگر کد را پشت‌سرهم بفرستی تلگرام آن را باطل می‌کند)"
+        )
+
+        return
+
+    # ---------- code ----------
+
+    if step == "code":
+
+        code = only_digits(text)
+
+        try:
+
+            await client.sign_in(
+                phone=login["phone"],
+                code=code,
+                phone_code_hash=login["hash"]
+            )
+
+        except SessionPasswordNeededError:
+
+            login["step"] = "password"
+
+            await safe_delete(event)
+
+            await event.respond("🔐 رمز تأیید دومرحله‌ای را بفرست.")
+
+            return
+
+        except PhoneCodeInvalidError:
+
+            await event.respond("❌ کد اشتباه است. دوباره بفرست.")
+            return
+
+        except PhoneCodeExpiredError:
+
+            login.update(step=None, phone=None, hash=None)
+
+            await event.respond("⌛ کد منقضی شد. دوباره /login بزن.")
+            return
+
+        await finish_login(event)
+
+        return
+
+    # ---------- 2FA password ----------
+
+    if step == "password":
+
+        try:
+
+            await client.sign_in(password=text)
+
+        except PasswordHashInvalidError:
+
+            await event.respond("❌ رمز اشتباه است. دوباره بفرست.")
+            return
+
+        await finish_login(event)
+
+        return
+
+    await event.respond("برای اتصال اکانت: /login")
+
+
+# =========================================================
+# 14. MAIN
 # =========================================================
 
 async def main():
@@ -2163,23 +2377,38 @@ async def main():
     print("MAFIA EMPIRE AUTO MANAGER")
     print("=" * 50)
 
-    print("Connecting through MTProto proxy...")
+    await bot.start(bot_token=BOT_TOKEN)
+    await client.connect()
 
-    await client.start()
+    if await client.is_user_authorized():
 
-    me = await client.get_me()
+        me = await client.get_me()
 
-    print("\nCONNECTED SUCCESSFULLY")
-    print("Account:", me.first_name)
-    print("Username:", me.username)
-    print("Proxy:", PROXY_HOST)
-    print("Port:", PROXY_PORT)
+        print("\nCONNECTED SUCCESSFULLY")
+        print("Account:", me.first_name)
+        print("Username:", me.username)
+
+        message = f"✅ سرویس بالا آمد و اکانت وصل است: {me.first_name}"
+
+    else:
+
+        print("Not logged in; waiting for /login via bot")
+
+        message = "⚠️ اکانت وصل نیست. /login را بزن."
+
+    try:
+
+        await bot.send_message(OWNER_ID, message)
+
+    except Exception as error:
+
+        print("[BOT NOTIFY ERROR]", repr(error))
 
     print("=" * 50)
     print("Waiting for group commands...")
     print("=" * 50)
 
-    await client.run_until_disconnected()
+    await bot.run_until_disconnected()
 
 
 if __name__ == "__main__":
