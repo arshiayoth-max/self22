@@ -24,11 +24,10 @@ from telethon.errors import (
 # 1. TELEGRAM ACCOUNT  (از Environment Variable خوانده می‌شود)
 # =========================================================
 
-API_ID = int(os.environ["36006348"])
-API_HASH = os.environ["caa664949252baecd0b18ce3bf589b91"]
-BOT_TOKEN = os.environ["8758291446:AAFVi179EV95tJn5PWdkT6FgqJpQISjizAQ"]
-OWNER_ID = int(os.environ["6646045908"])  # آیدی عددی خودت
-
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER_ID = int(os.environ["OWNER_ID"])
 # مسیر Volume در Railway
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
