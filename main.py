@@ -3,6 +3,8 @@ import contextvars
 import logging
 import secrets
 import shutil
+import tempfile
+import zipfile
 import json
 import base64
 import os
@@ -10,7 +12,7 @@ import re
 import random
 import time
 import math
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telethon import TelegramClient, events, connection, Button
@@ -128,6 +130,7 @@ class Account:
         self.price_learning_state = {}
         self.battle_settings = {}
         self.battle_tasks = {}
+        self.energy_tasks = {}
         self.battle_settings_loaded = False
 
     @property
@@ -148,7 +151,7 @@ class Account:
 
     def stop_tasks(self):
 
-        for group in (self.tasks, self.battle_tasks):
+        for group in (self.tasks, self.battle_tasks, self.energy_tasks):
 
             for task in list(group.values()):
 
@@ -211,8 +214,16 @@ bot = TelegramClient(
 DEFAULT_SETTINGS = {
     "product": "نام محصول",
     "min_price": 300000,
-    "warehouse_capacity": 350,
-    "interval": 1800
+    "warehouse_capacity": 350,   # حداقل موجودی انبار (این مقدار یا بیشتر)
+    "interval": 1800,
+    "check_mode": "both",        # both = انبار و قیمت | price = فقط قیمت | warehouse = فقط انبار
+    "hourly": False,             # بررسی هر ساعت بر اساس وقت ایران
+    "hourly_minute": 0,
+    "energy": False,             # قابلیت «انرژی کافی نداری»
+    "energy_delay": 20,          # دقیقه
+    "energy_text": "انرژی 30",
+    "running": False,            # بعد از ری‌استارت/دیپلوی خودکار ادامه پیدا می‌کند
+    "title": ""                  # اسم گروه (برای پنل)
 }
 
 settings = _AccountDict("settings")
@@ -1063,37 +1074,45 @@ async def run_cycle(chat_id, test=False):
 
         print("\n[2] WAREHOUSE")
 
+        check_mode = config.get("check_mode", "both")
+        needs_warehouse = check_mode in ("both", "warehouse")
+        needs_price = check_mode in ("both", "price")
+
         warehouse = get_warehouse(
             factory_message.raw_text or ""
         )
 
         if warehouse is None:
 
-            raise RuntimeError(
-                "اطلاعات انبار قابل استخراج نیست."
-            )
+            if needs_warehouse:
 
-        current, maximum = warehouse
+                raise RuntimeError(
+                    "اطلاعات انبار قابل استخراج نیست."
+                )
+
+            current, maximum = 0, 0
+
+        else:
+
+            current, maximum = warehouse
 
         print(
             f"Warehouse: {current}/{maximum}"
         )
 
-        if not test:
+        if not test and needs_warehouse:
 
             required = config["warehouse_capacity"]
 
-            if (
-                current != required
-                or maximum != required
-            ):
+            # حداقل موجودی: اگر انبار این مقدار یا بیشتر بود
+            if current < required:
 
                 await send_report(
                     chat_id,
-                    f"⏸ انبار کامل نیست.\n"
+                    f"⏸ موجودی انبار به حداقل نرسیده است.\n"
                     f"مقدار فعلی: {current}/{maximum}\n"
-                    f"ظرفیت مورد انتظار: {required}\n"
-                    f"{config['interval'] // 60} دقیقه دیگر دوباره بررسی می‌کنم."
+                    f"حداقل موجودی: {required}\n"
+                    f"{next_check_text(config)} دوباره بررسی می‌کنم."
                 )
 
                 return False
@@ -1164,7 +1183,7 @@ async def run_cycle(chat_id, test=False):
                 prediction_report
             )
 
-        if not test:
+        if not test and needs_price:
 
             minimum = config["min_price"]
 
@@ -1175,7 +1194,7 @@ async def run_cycle(chat_id, test=False):
                     f"⏸ قیمت مناسب نیست.\n"
                     f"قیمت فعلی: {price:,}\n"
                     f"حداقل قیمت: {minimum:,}\n"
-                    f"{config['interval'] // 60} دقیقه دیگر بررسی می‌کنم."
+                    f"{next_check_text(config)} بررسی می‌کنم."
                 )
 
                 return False
@@ -1220,11 +1239,14 @@ async def run_cycle(chat_id, test=False):
 # 9. AUTOMATIC LOOP
 # =========================================================
 
-async def automatic_loop(chat_id):
+async def automatic_loop(chat_id, skip_first=False):
 
     print(
         f"[AUTO] Started for group {chat_id}"
     )
+
+    if skip_first:
+        await wait_next_cycle(chat_id)
 
     while True:
 
@@ -1266,10 +1288,20 @@ async def automatic_loop(chat_id):
 
             interval_event.clear()
 
-            interval = get_settings(chat_id)["interval"]
+            wait_config = get_settings(chat_id)
+
+            if wait_config.get("hourly"):
+
+                interval = seconds_until_next_hour(
+                    int(wait_config.get("hourly_minute", 0))
+                )
+
+            else:
+
+                interval = wait_config["interval"]
 
             print(
-                f"[AUTO] Next cycle in {interval // 60} minutes"
+                f"[AUTO] Next cycle in {int(interval // 60)} minutes"
             )
 
             try:
@@ -1366,7 +1398,7 @@ def schedule_command_delete(event):
 # =========================================================
 
 COMMAND_PATTERN = (
-    r"(?i)^/(GO|OFF|TEST|INFO|P|MIN|CAP|TIME|PREDICT|HELP|START|STOP|STATUS|PRODUCT|PRICE|CAPACITY|INTERVAL)(?:\s+.*)?$"
+    r"(?i)^/(GO|OFF|TEST|INFO|P|MIN|CAP|TIME|PREDICT|HELP|START|STOP|STATUS|PRODUCT|PRICE|CAPACITY|INTERVAL|HOURLY|H|MODE|M|ENERGY|E|PANEL)(?:\s+.*)?$"
 )
 
 
@@ -1397,7 +1429,10 @@ async def command_handler(event):
         "/P": "/PRODUCT",
         "/MIN": "/PRICE",
         "/CAP": "/CAPACITY",
-        "/TIME": "/INTERVAL"
+        "/TIME": "/INTERVAL",
+        "/H": "/HOURLY",
+        "/M": "/MODE",
+        "/E": "/ENERGY"
     }
 
     command = aliases.get(command, command)
@@ -1412,7 +1447,11 @@ async def command_handler(event):
         "/CAPACITY",
         "/INTERVAL",
         "/PREDICT",
-        "/HELP"
+        "/HELP",
+        "/HOURLY",
+        "/MODE",
+        "/ENERGY",
+        "/PANEL"
     }
 
     if command not in valid_commands:
@@ -1445,6 +1484,9 @@ async def command_handler(event):
             automatic_loop(chat_id)
         )
 
+        config["running"] = True
+        save_settings()
+
         await send_report(
             chat_id,
             "🚀 مدیریت خودکار فعال شد."
@@ -1455,6 +1497,9 @@ async def command_handler(event):
     # -----------------------------------------------------
 
     elif command == "/STOP":
+
+        config["running"] = False
+        save_settings()
 
         task = tasks.get(chat_id)
 
@@ -1520,10 +1565,12 @@ async def command_handler(event):
             f"{'فعال' if running else 'متوقف'}\n\n"
             f"محصول: {config['product']}\n"
             f"حداقل قیمت: {config['min_price']:,}\n"
-            f"ظرفیت انبار: "
+            f"حداقل موجودی انبار: "
             f"{config['warehouse_capacity']}\n"
-            f"فاصله بررسی: "
-            f"{config['interval'] // 60} دقیقه"
+            f"حالت بررسی: {MODE_LABELS.get(config.get('check_mode', 'both'))}\n"
+            f"زمان‌بندی: {schedule_text(config)}\n"
+            f"قابلیت انرژی: "
+            f"{'فعال' if config.get('energy') else 'خاموش'}"
         )
 
     # -----------------------------------------------------
@@ -1598,7 +1645,7 @@ async def command_handler(event):
 
             await send_report(
                 chat_id,
-                f"✅ ظرفیت انبار تنظیم شد:\n{value}"
+                f"✅ حداقل موجودی انبار تنظیم شد:\n{value}"
             )
 
         except ValueError:
@@ -1670,70 +1717,215 @@ async def command_handler(event):
     # HELP
     # -----------------------------------------------------
 
+    # -----------------------------------------------------
+    # MODE  (1 = انبار و قیمت | 2 = فقط قیمت | 3 = فقط انبار)
+    # -----------------------------------------------------
+
+    elif command == "/MODE":
+
+        choice = normalize_digits(argument).strip().lower()
+
+        modes = {
+            "1": "both", "both": "both", "هردو": "both",
+            "2": "price", "price": "price", "قیمت": "price",
+            "3": "warehouse", "warehouse": "warehouse", "انبار": "warehouse"
+        }
+
+        if choice not in modes:
+
+            await send_report(
+                chat_id,
+                "فرمت صحیح:\n"
+                "/MODE 1 ← توجه به انبار و قیمت\n"
+                "/MODE 2 ← توجه فقط به قیمت\n"
+                "/MODE 3 ← توجه فقط به انبار\n\n"
+                f"حالت فعلی: {MODE_LABELS.get(config.get('check_mode', 'both'))}"
+            )
+
+            return
+
+        config["check_mode"] = modes[choice]
+
+        save_settings()
+
+        await send_report(
+            chat_id,
+            f"✅ حالت بررسی تنظیم شد:\n{MODE_LABELS[modes[choice]]}"
+        )
+
+    # -----------------------------------------------------
+    # HOURLY  (بررسی هر ساعت بر اساس وقت ایران)
+    # -----------------------------------------------------
+
+    elif command == "/HOURLY":
+
+        parts_h = normalize_digits(argument).split()
+        word = parts_h[0].lower() if parts_h else ""
+
+        if word in ("on", "1", "روشن"):
+
+            minute = 0
+
+            if len(parts_h) > 1 and parts_h[1].isdigit():
+                minute = min(59, int(parts_h[1]))
+
+            config["hourly"] = True
+            config["hourly_minute"] = minute
+
+            save_settings()
+
+            get_interval_event(chat_id).set()
+
+            await send_report(
+                chat_id,
+                "✅ بررسی ساعتی فعال شد.\n"
+                f"هر ساعت، دقیقه {minute:02d} به وقت ایران بررسی می‌کنم.\n"
+                f"بررسی بعدی: {next_check_text(config)}"
+            )
+
+        elif word in ("off", "0", "خاموش"):
+
+            config["hourly"] = False
+
+            save_settings()
+
+            get_interval_event(chat_id).set()
+
+            await send_report(
+                chat_id,
+                "✅ بررسی ساعتی خاموش شد.\n"
+                f"از حالا هر {config['interval'] // 60} دقیقه بررسی می‌کنم."
+            )
+
+        else:
+
+            await send_report(
+                chat_id,
+                "فرمت صحیح:\n"
+                "/H on ← هر ساعت (مثلاً 6:00 و 7:00 و ...) به وقت ایران\n"
+                "/H on 5 ← هر ساعت در دقیقه ۵ (مثلاً 6:05 و 7:05)\n"
+                "/H off ← خاموش\n\n"
+                f"وضعیت فعلی: {schedule_text(config)}"
+            )
+
+    # -----------------------------------------------------
+    # ENERGY  (انرژی کافی نداری -> بعد از N دقیقه متن)
+    # -----------------------------------------------------
+
+    elif command == "/ENERGY":
+
+        text_e = normalize_digits(argument).strip()
+        word = text_e.lower()
+        match = re.match(r"^(\d+)\s+(.+)$", text_e)
+
+        if word in ("on", "1", "روشن"):
+
+            config["energy"] = True
+            save_settings()
+
+            await send_report(
+                chat_id,
+                "✅ قابلیت انرژی فعال شد.\n"
+                f"اگر پیامی (در پاسخ به پیام خودت) شامل «{ENERGY_PHRASE}» ببینم، "
+                f"بعد از {config['energy_delay']} دقیقه «{config['energy_text']}» می‌نویسم."
+            )
+
+        elif word in ("off", "0", "خاموش"):
+
+            config["energy"] = False
+            save_settings()
+
+            await send_report(chat_id, "✅ قابلیت انرژی خاموش شد.")
+
+        elif match:
+
+            config["energy_delay"] = int(match.group(1))
+            config["energy_text"] = match.group(2).strip()
+            save_settings()
+
+            await send_report(
+                chat_id,
+                "✅ تنظیم شد:\n"
+                f"تاخیر: {config['energy_delay']} دقیقه\n"
+                f"متن: {config['energy_text']}"
+            )
+
+        else:
+
+            await send_report(
+                chat_id,
+                "فرمت صحیح:\n"
+                "/E on ← روشن\n"
+                "/E off ← خاموش\n"
+                "/E 20 انرژی 30 ← تاخیر (دقیقه) و متن\n\n"
+                f"وضعیت: {'فعال' if config.get('energy') else 'خاموش'}\n"
+                f"تاخیر: {config['energy_delay']} دقیقه\n"
+                f"متن: {config['energy_text']}"
+            )
+
+    # -----------------------------------------------------
+    # PANEL  (پنل دکمه‌ای در پیوی ربات باز می‌شود)
+    # -----------------------------------------------------
+
+    elif command == "/PANEL":
+
+        account = CUR.get()
+        holder = account.meta.get("bot_user", OWNER_ID)
+
+        try:
+
+            chat = await event.get_chat()
+            title = getattr(chat, "title", "") or ""
+
+        except Exception:
+
+            title = ""
+
+        if title and config.get("title") != title:
+
+            config["title"] = title
+            save_settings()
+
+        panel_text, rows = group_panel(account.id, str(chat_id))
+
+        try:
+
+            await bot.send_message(holder, panel_text, buttons=rows)
+
+        except Exception as error:
+
+            print("[PANEL SEND ERROR]", repr(error))
+
+            await send_report(
+                chat_id,
+                "⚠️ نتوانستم پنل را در ربات بفرستم.\n"
+                "ابتدا ربات را باز کن و /start بزن، بعد دوباره /panel را بنویس."
+            )
+
+    # -----------------------------------------------------
+    # HELP
+    # -----------------------------------------------------
+
     elif command == "/HELP":
 
         await send_report(
             chat_id,
             """
-📋 MAFIA EMPIRE AUTO MANAGER
-
-━━━━━━━━━━━━━━━━━━
-🏭 FACTORY MANAGER
+📋 راهنمای سلف
 ━━━━━━━━━━━━━━━━━━
 
-/GO - شروع مدیریت خودکار
-/OFF - توقف مدیریت خودکار
-/TEST - اجرای تست کامل
-/INFO - مشاهده وضعیت
+⚙️ /panel
+پنل تنظیمات با دکمه (داخل ربات باز می‌شود): حالت بررسی، حداقل انبار و قیمت، ساعت ایران، ریپلای، انرژی و ...
 
-/P نام محصول - تعیین محصول
-/MIN عدد - تعیین حداقل قیمت
-/CAP عدد - تعیین ظرفیت انبار
-/TIME عدد - تعیین فاصله بررسی (دقیقه)
-/PREDICT - مشاهده پیش‌بینی قیمت یک ساعت آینده
+▶️ /GO ← شروع
+⏹ /OFF ← توقف
+📊 /INFO ← وضعیت
 
-━━━━━━━━━━━━━━━━━━
-⚔️ AUTO BATTLE
-━━━━━━━━━━━━━━━━━━
+⚔️ Auto Battle
+روی پیام شخص Reply کن و /N بزن (شروع)؛ /NX برای توقف.
 
-/W کلمه
-
-تعیین کلمه عملیات.
-نیازی به Reply نیست.
-
-مثال:
-/W سلام
-
-/N
-
-شروع Auto Battle برای شخص موردنظر.
-
-نحوه استفاده:
-1. پیام شخص موردنظر را پیدا کن.
-2. روی پیام او Reply کن.
-3. دستور /N را ارسال کن.
-
-هر شخص عملیات مستقل خودش را دارد.
-
-/NX
-
-توقف Auto Battle شخص موردنظر.
-
-نحوه استفاده:
-1. روی پیام همان شخص Reply کن.
-2. دستور /NX را ارسال کن.
-
-با این دستور فقط عملیات همان شخص متوقف می‌شود.
-عملیات اشخاص دیگر ادامه پیدا می‌کند.
-
-━━━━━━━━━━━━━━━━━━
-📨 REPORTS
-━━━━━━━━━━━━━━━━━━
-
-تمام گزارش‌ها، خطاها، نتایج عملیات
-و پیام‌های توقف در Saved Messages ارسال می‌شوند.
-
-تنظیمات کارخانه برای هر گروه جداگانه ذخیره می‌شوند.
+همه‌ی گزارش‌ها در Saved Messages می‌آیند.
+(دستورهای قدیمی مثل /MODE و /H و /E و /D هم هنوز کار می‌کنند.)
 """
         )
 
@@ -1816,6 +2008,68 @@ def set_battle_word(chat_id, word):
     battle_settings[key]["word"] = word
 
     save_battle_settings()
+
+
+def get_battle_delay(chat_id):
+
+    load_battle_settings()
+
+    data = battle_settings.get(str(chat_id), {})
+
+    low = int(data.get("delay_min", 360))
+    high = int(data.get("delay_max", 600))
+
+    if high <= low:
+        return low
+
+    # ثانیه‌ی تصادفی هم حفظ می‌شود
+    return random.randint(low, high)
+
+
+def set_battle_delay(chat_id, low, high):
+
+    load_battle_settings()
+
+    key = str(chat_id)
+
+    if key not in battle_settings:
+        battle_settings[key] = {}
+
+    battle_settings[key]["delay_min"] = int(low)
+    battle_settings[key]["delay_max"] = int(high)
+
+    save_battle_settings()
+
+
+def add_battle_target(chat_id, target_user_id):
+
+    load_battle_settings()
+
+    key = str(chat_id)
+
+    if key not in battle_settings:
+        battle_settings[key] = {}
+
+    targets = battle_settings[key].setdefault("targets", [])
+
+    if target_user_id not in targets:
+        targets.append(target_user_id)
+
+    save_battle_settings()
+
+
+def remove_battle_target(chat_id, target_user_id):
+
+    load_battle_settings()
+
+    data = battle_settings.get(str(chat_id), {})
+
+    targets = data.get("targets", [])
+
+    if target_user_id in targets:
+
+        targets.remove(target_user_id)
+        save_battle_settings()
 
 
 # ---------------------------------------------------------
@@ -2121,6 +2375,8 @@ async def automatic_battle_loop(
 
             if not result:
 
+                remove_battle_target(chat_id, target_user_id)
+
                 await send_report(
                     chat_id,
                     f"🛑 عملیات متوقف شد.\n"
@@ -2133,7 +2389,7 @@ async def automatic_battle_loop(
 
                 return
 
-            delay = random.randint(360, 600)
+            delay = get_battle_delay(chat_id)
 
             print(
                 f"[BATTLE] Next cycle in "
@@ -2154,6 +2410,8 @@ async def automatic_battle_loop(
             repr(error)
         )
 
+        remove_battle_target(chat_id, target_user_id)
+
         await send_report(
             chat_id,
             f"⚠️ عملیات متوقف شد.\n"
@@ -2167,7 +2425,7 @@ async def automatic_battle_loop(
 # BATTLE COMMAND HANDLER
 # ---------------------------------------------------------
 
-BATTLE_PATTERN = r"(?i)^/(?:NX|N|W)(?:\s+.*)?$"
+BATTLE_PATTERN = r"(?i)^/(?:NX|N|W|DELAY|D)(?:\s+.*)?$"
 
 
 async def battle_command_handler(event):
@@ -2213,6 +2471,64 @@ async def battle_command_handler(event):
             chat_id,
             f"✅ کلمه عملیات تنظیم شد:\n{argument}"
         )
+
+        return
+
+    # -----------------------------------------------------
+    # D - REPLY DELAY RANGE
+    # -----------------------------------------------------
+
+    if command in ("/D", "/DELAY"):
+
+        numbers = re.findall(
+            r"\d+(?:[.,٫]\d+)?",
+            normalize_digits(argument)
+        )
+
+        if not numbers:
+
+            await send_report(
+                chat_id,
+                "فرمت صحیح:\n"
+                "/D 2 5 ← بین ۲ تا ۵ دقیقه (ثانیه‌ها تصادفی)\n"
+                "/D 2 ← دقیقاً ۲ دقیقه"
+            )
+
+            return
+
+        values = [
+            float(item.replace(",", ".").replace("٫", "."))
+            for item in numbers[:2]
+        ]
+
+        low = int(min(values) * 60)
+        high = int(max(values) * 60)
+
+        if low < 10:
+
+            await send_report(
+                chat_id,
+                "⚠️ حداقل زمان ریپلای ۱۰ ثانیه است."
+            )
+
+            return
+
+        set_battle_delay(chat_id, low, high)
+
+        if low == high:
+
+            await send_report(
+                chat_id,
+                f"✅ زمان ریپلای تنظیم شد:\nدقیقاً {low / 60:g} دقیقه"
+            )
+
+        else:
+
+            await send_report(
+                chat_id,
+                "✅ بازه‌ی زمان ریپلای تنظیم شد:\n"
+                f"بین {low / 60:g} تا {high / 60:g} دقیقه (ثانیه‌ها تصادفی)"
+            )
 
         return
 
@@ -2283,6 +2599,8 @@ async def battle_command_handler(event):
             )
         )
 
+        add_battle_target(chat_id, target_user_id)
+
         await send_report(
             chat_id,
             "🚀 سیستم Auto Battle فعال شد.\n"
@@ -2296,6 +2614,8 @@ async def battle_command_handler(event):
     # -----------------------------------------------------
 
     elif command == "/NX":
+
+        remove_battle_target(chat_id, target_user_id)
 
         task = battle_tasks.get(task_key)
 
@@ -2316,6 +2636,186 @@ async def battle_command_handler(event):
                 "سیستم Auto Battle برای این شخص فعال نیست.\n"
                 f"شناسه: `{target_user_id}`"
             )
+
+
+# =========================================================
+# 12.1. IRAN TIME / MODES / ENERGY
+# =========================================================
+
+# ایران از سال ۱۴۰۱ ساعت تابستانی ندارد؛ پس اختلاف ثابت +3:30 است
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+MODE_LABELS = {
+    "both": "توجه به انبار و قیمت",
+    "price": "توجه فقط به قیمت",
+    "warehouse": "توجه فقط به انبار"
+}
+
+
+def iran_now():
+
+    return datetime.now(IRAN_TZ)
+
+
+def next_hour_datetime(minute=0):
+
+    now = iran_now()
+
+    target = now.replace(minute=minute, second=0, microsecond=0)
+
+    if target <= now:
+        target += timedelta(hours=1)
+
+    return target
+
+
+def seconds_until_next_hour(minute=0):
+
+    return max(
+        1.0,
+        (next_hour_datetime(minute) - iran_now()).total_seconds()
+    )
+
+
+def next_check_text(config):
+
+    if config.get("hourly"):
+
+        target = next_hour_datetime(int(config.get("hourly_minute", 0)))
+
+        return f"ساعت {target.strftime('%H:%M')} به وقت ایران"
+
+    return f"{config['interval'] // 60} دقیقه دیگر"
+
+
+def schedule_text(config):
+
+    if config.get("hourly"):
+
+        return (
+            f"هر ساعت، دقیقه {int(config.get('hourly_minute', 0)):02d} "
+            "(وقت ایران)"
+        )
+
+    return f"هر {config['interval'] // 60} دقیقه"
+
+
+async def wait_next_cycle(chat_id):
+
+    interval_event = get_interval_event(chat_id)
+
+    while True:
+
+        interval_event.clear()
+
+        wait_config = get_settings(chat_id)
+
+        if wait_config.get("hourly"):
+
+            interval = seconds_until_next_hour(
+                int(wait_config.get("hourly_minute", 0))
+            )
+
+        else:
+
+            interval = wait_config["interval"]
+
+        try:
+
+            await asyncio.wait_for(
+                interval_event.wait(),
+                timeout=interval
+            )
+
+        except asyncio.TimeoutError:
+
+            return
+
+
+ENERGY_PHRASE = "انرژی کافی نداری"
+
+
+def normalize_fa(text):
+
+    text = normalize_market_line(text or "")
+
+    return (
+        text.replace("ي", "ی")
+        .replace("ك", "ک")
+        .replace("\u200c", " ")
+    )
+
+
+async def energy_send_later(chat_id, delay_seconds, text):
+
+    try:
+
+        await asyncio.sleep(delay_seconds)
+
+        account = CUR.get()
+
+        if not account.is_active():
+            return
+
+        if not get_settings(chat_id).get("energy"):
+            return
+
+        await client.send_message(chat_id, text)
+
+        print("[ENERGY] Sent:", text)
+
+    except asyncio.CancelledError:
+
+        raise
+
+    except Exception as error:
+
+        print("[ENERGY ERROR]", repr(error))
+
+
+async def energy_watch_handler(event):
+
+    if not event.is_group:
+        return
+
+    chat_id = event.chat_id
+
+    # فقط گروه‌هایی که قبلاً تنظیم شده‌اند
+    if str(chat_id) not in settings:
+        return
+
+    config = get_settings(chat_id)
+
+    if not config.get("energy"):
+        return
+
+    if ENERGY_PHRASE not in normalize_fa(event.raw_text):
+        return
+
+    # فقط وقتی بازی به پیام خودِ این اکانت جواب داده است
+    reply = await event.get_reply_message()
+
+    if reply is None or not reply.out:
+        return
+
+    account = CUR.get()
+
+    existing = account.energy_tasks.get(chat_id)
+
+    if existing and not existing.done():
+        return
+
+    delay_minutes = max(0, int(config.get("energy_delay", 20)))
+    text = config.get("energy_text", "انرژی 30")
+
+    account.energy_tasks[chat_id] = asyncio.create_task(
+        energy_send_later(chat_id, delay_minutes * 60, text)
+    )
+
+    await send_report(
+        chat_id,
+        f"⚡ انرژی کافی نبود؛ بعد از {delay_minutes} دقیقه «{text}» ارسال می‌شود."
+    )
 
 
 # =========================================================
@@ -2641,8 +3141,59 @@ async def start_account(account_id, account_client=None):
 
     if account.authorized:
         attach_handlers(account)
+        resume_account(account)
 
     return account
+
+
+def resume_account(account):
+
+    """کارهایی که قبل از ری‌استارت/خاموشی در حال اجرا بودند، دوباره ادامه پیدا می‌کنند."""
+
+    if not account.authorized or not account.is_active():
+        return
+
+    token = CUR.set(account)
+
+    try:
+
+        for key, config in list(account.settings.items()):
+
+            if isinstance(config, dict) and config.get("running"):
+
+                chat_id = int(key)
+                task = account.tasks.get(chat_id)
+
+                if task is None or task.done():
+
+                    account.tasks[chat_id] = asyncio.create_task(
+                        automatic_loop(chat_id, skip_first=True)
+                    )
+
+                    print(f"[RESUME] factory {account.id} chat={chat_id}")
+
+        for key, data in list(account.battle_settings.items()):
+
+            if not isinstance(data, dict):
+                continue
+
+            for target in list(data.get("targets", [])):
+
+                chat_id = int(key)
+                task_key = (chat_id, target)
+                task = account.battle_tasks.get(task_key)
+
+                if task is None or task.done():
+
+                    account.battle_tasks[task_key] = asyncio.create_task(
+                        automatic_battle_loop(chat_id, None, target)
+                    )
+
+                    print(f"[RESUME] battle {account.id} chat={chat_id} target={target}")
+
+    finally:
+
+        CUR.reset(token)
 
 
 async def remove_account(account_id):
@@ -2704,6 +3255,16 @@ def attach_handlers(account):
     account.client.add_event_handler(
         bind(account, battle_command_handler),
         events.NewMessage(outgoing=True, pattern=BATTLE_PATTERN)
+    )
+
+    account.client.add_event_handler(
+        bind(account, energy_watch_handler),
+        events.NewMessage(incoming=True)
+    )
+
+    account.client.add_event_handler(
+        bind(account, energy_watch_handler),
+        events.MessageEdited(incoming=True)
     )
 
     account.handlers_attached = True
@@ -2795,6 +3356,11 @@ def apply_grant(account_id, days):
     meta["enabled"] = True
 
     save_accounts_meta()
+
+    account = accounts.get(account_id)
+
+    if account is not None:
+        resume_account(account)
 
 
 async def notify(user_id, text, buttons=None):
@@ -3019,6 +3585,7 @@ def user_menu(user_id):
 
     if find_user_account(user_id):
 
+        rows.append([Button.inline("⚙️ پنل سلف من", data=b"spm")])
         rows.append([Button.inline("📊 وضعیت من", data=b"status")])
 
     text = (
@@ -3062,7 +3629,9 @@ def admin_menu(user_id=None):
 
     rows = [
         [Button.inline(f"📋 اکانت‌ها ({len(accounts_meta)}/{MAX_ACCOUNTS})", data=b"accs")],
-        [Button.inline("🎟 ساخت کد ویژه", data=b"newcode")]
+        [Button.inline("🎟 ساخت کد ویژه", data=b"newcode")],
+        [Button.inline("📢 پیام همگانی", data=b"bc")],
+        [Button.inline("⚙️ پنل سلف من", data=b"spm")]
     ]
 
     own_line = ""
@@ -3111,6 +3680,12 @@ def owner_menu():
             Button.inline(f"👮 ادمین‌ها ({len(STATE['admins'])})", data=b"admins"),
             Button.inline("📜 کدها", data=b"codes")
         ],
+        [
+            Button.inline("📢 پیام همگانی", data=b"bc"),
+            Button.inline("📦 پشتیبان‌گیری", data=b"backup")
+        ],
+        [Button.inline("♻️ بازیابی از پشتیبان", data=b"restore")],
+        [Button.inline("⚙️ پنل سلف من", data=b"spm")],
         [Button.inline(global_label, data=b"gtog")]
     ]
 
@@ -3572,6 +4147,532 @@ async def handle_buy(event, user_id):
 # CALLBACKS
 # ---------------------------------------------------------
 
+# ---------------------------------------------------------
+# پنل دکمه‌ای سلف (در پیوی ربات)
+# ---------------------------------------------------------
+
+MODE_ORDER = ["both", "price", "warehouse"]
+
+MODE_SHORT = {
+    "both": "انبار + قیمت",
+    "price": "فقط قیمت",
+    "warehouse": "فقط انبار"
+}
+
+PANEL_PROMPTS = {
+    "price": "💰 حداقل قیمت را بفرست (فقط عدد).",
+    "cap": "🏭 حداقل موجودی انبار را بفرست (فقط عدد).",
+    "interval": "⏱ فاصله‌ی بررسی را به دقیقه بفرست (فقط عدد).",
+    "minute": "🕐 دقیقه‌ی بررسی در هر ساعت را بفرست (۰ تا ۵۹).",
+    "product": "📦 اسم محصول را بفرست.",
+    "edelay": "⏳ تاخیر قابلیت انرژی را به دقیقه بفرست.",
+    "etext": "✏️ متنی که بعد از «انرژی کافی نداری» ارسال شود را بفرست.",
+    "bdelay": "🕹 زمان ریپلای را به دقیقه بفرست.\nمثال: 2 5 ← بین ۲ تا ۵ دقیقه | 2 ← دقیقاً ۲ دقیقه",
+    "bword": "💬 کلمه‌ی عملیات (Auto Battle) را بفرست."
+}
+
+
+def accounts_of(user_id):
+
+    return [
+        account_id
+        for account_id, meta in accounts_meta.items()
+        if meta.get("bot_user", OWNER_ID) == user_id
+    ]
+
+
+def owned_account(user_id, account_id):
+
+    meta = accounts_meta.get(account_id)
+
+    if meta is None or meta.get("bot_user", OWNER_ID) != user_id:
+        return None
+
+    return accounts.get(account_id)
+
+
+def group_title(account, chat_key):
+
+    config = account.settings.get(chat_key, {})
+
+    return config.get("title") or f"گروه {chat_key}"
+
+
+def groups_panel(account_id):
+
+    account = accounts.get(account_id)
+    meta = accounts_meta.get(account_id, {})
+
+    lines = [
+        f"⚙️ پنل سلف — {meta.get('name', account_id)}",
+        "━━━━━━━━━━━━━━━━━━"
+    ]
+
+    rows = []
+
+    if account is not None:
+
+        for chat_key, config in account.settings.items():
+
+            if isinstance(config, dict):
+
+                rows.append([
+                    Button.inline(
+                        f"{'▶️' if config.get('running') else '👥'} {group_title(account, chat_key)}",
+                        data=f"spg:{account_id}:{chat_key}".encode()
+                    )
+                ])
+
+    if rows:
+
+        lines.append("یک گروه را انتخاب کن:")
+        lines.append("\nبرای افزودن گروه جدید، داخل همان گروه (با همین اکانت) بنویس /panel")
+
+    else:
+
+        lines.append(
+            "هنوز گروهی ثبت نشده است.\n"
+            "داخل گروه بازی (با همین اکانت) بنویس /panel تا گروه اینجا اضافه شود."
+        )
+
+    rows.append(back_button())
+
+    return "\n".join(lines), rows
+
+
+def group_panel(account_id, chat_key):
+
+    account = accounts.get(account_id)
+
+    if account is None or chat_key not in account.settings:
+        return groups_panel(account_id)
+
+    config = account.settings[chat_key]
+    chat_id = int(chat_key)
+
+    battle = account.battle_settings.get(chat_key, {})
+    low = int(battle.get("delay_min", 360))
+    high = int(battle.get("delay_max", 600))
+
+    delay_text = (
+        f"{low / 60:g} دقیقه"
+        if high <= low
+        else f"{low / 60:g} تا {high / 60:g} دقیقه"
+    )
+
+    task = account.tasks.get(chat_id)
+    running = task is not None and not task.done()
+
+    mode = config.get("check_mode", "both")
+
+    text = (
+        f"⚙️ {group_title(account, chat_key)}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"وضعیت سلف: {status_text(account_id)}\n"
+        f"مدیریت کارخانه: {'▶️ در حال اجرا' if running else '⏹ متوقف'}\n\n"
+        f"🎯 حالت بررسی: {MODE_SHORT.get(mode)}\n"
+        f"🏭 حداقل انبار: {config.get('warehouse_capacity')}\n"
+        f"💰 حداقل قیمت: {int(config.get('min_price', 0)):,}\n"
+        f"📦 محصول: {config.get('product')}\n"
+        f"⏰ زمان‌بندی: {schedule_text(config)}\n"
+        f"⚡ انرژی: {'روشن' if config.get('energy') else 'خاموش'} "
+        f"({config.get('energy_delay')} دقیقه ← «{config.get('energy_text')}»)\n"
+        f"🕹 ریپلای: {delay_text} | کلمه: {battle.get('word') or '—'}"
+    )
+
+    def key(label, op):
+        return Button.inline(label, data=f"spo:{op}:{account_id}:{chat_key}".encode())
+
+    rows = [
+        [key("▶️ شروع", "go"), key("⏹ توقف", "off")],
+        [key(f"🎯 حالت: {MODE_SHORT.get(mode)}", "mode")],
+        [
+            key(f"🏭 حداقل انبار: {config.get('warehouse_capacity')}", "cap"),
+            key(f"💰 حداقل قیمت: {int(config.get('min_price', 0)):,}", "price")
+        ],
+        [key(f"📦 محصول: {config.get('product')}", "product")],
+        [key(f"⏰ {'ساعتی (وقت ایران)' if config.get('hourly') else 'فاصله‌ای'} ⟲", "hourly")],
+    ]
+
+    if config.get("hourly"):
+
+        rows.append([key(f"🕐 دقیقه‌ی ساعت: {int(config.get('hourly_minute', 0)):02d}", "minute")])
+
+    else:
+
+        rows.append([key(f"⏱ فاصله: {config.get('interval', 1800) // 60} دقیقه", "interval")])
+
+    rows.append([
+        key(f"⚡ انرژی: {'روشن' if config.get('energy') else 'خاموش'}", "energy"),
+        key("⏳ تاخیر", "edelay"),
+        key("✏️ متن", "etext")
+    ])
+
+    rows.append([key("🕹 زمان ریپلای", "bdelay"), key("💬 کلمه عملیات", "bword")])
+
+    rows.append([
+        key("🔄 به‌روزرسانی", "refresh"),
+        Button.inline("⬅️ بازگشت", data=f"spa:{account_id}".encode())
+    ])
+
+    return text, rows
+
+
+def apply_panel_input(account, chat_key, field, text):
+
+    """مقدار تایپ‌شده در پنل را اعمال می‌کند. خروجی: (موفق؟، پیام)"""
+
+    chat_id = int(chat_key)
+    raw = normalize_digits(text or "").strip()
+
+    token = CUR.set(account)
+
+    try:
+
+        config = get_settings(chat_id)
+
+        if field in ("price", "cap"):
+
+            try:
+                value = clean_number(raw)
+            except ValueError:
+                return False, "❌ فقط یک عدد بفرست."
+
+            if field == "cap" and value <= 0:
+                return False, "❌ عدد باید بزرگ‌تر از صفر باشد."
+
+            config["min_price" if field == "price" else "warehouse_capacity"] = value
+
+        elif field in ("interval", "minute", "edelay"):
+
+            numbers = re.findall(r"\d+", raw)
+
+            if not numbers:
+                return False, "❌ فقط یک عدد بفرست."
+
+            value = int(numbers[0])
+
+            if field == "interval":
+
+                if value <= 0:
+                    return False, "❌ عدد باید بزرگ‌تر از صفر باشد."
+
+                config["interval"] = value * 60
+                get_interval_event(chat_id).set()
+
+            elif field == "minute":
+
+                if value > 59:
+                    return False, "❌ عدد باید بین ۰ تا ۵۹ باشد."
+
+                config["hourly_minute"] = value
+                get_interval_event(chat_id).set()
+
+            else:
+
+                config["energy_delay"] = value
+
+        elif field in ("product", "etext", "bword"):
+
+            value = (text or "").strip()
+
+            if not value:
+                return False, "❌ متن خالی است."
+
+            if field == "product":
+                config["product"] = value
+            elif field == "etext":
+                config["energy_text"] = value
+            else:
+                set_battle_word(chat_id, value)
+                return True, "✅ ذخیره شد."
+
+        elif field == "bdelay":
+
+            numbers = re.findall(r"\d+(?:[.,٫]\d+)?", raw)
+
+            if not numbers:
+                return False, "❌ یک یا دو عدد بفرست؛ مثلاً: 2 5"
+
+            values = [
+                float(item.replace(",", ".").replace("٫", "."))
+                for item in numbers[:2]
+            ]
+
+            low = int(min(values) * 60)
+            high = int(max(values) * 60)
+
+            if low < 10:
+                return False, "❌ حداقل زمان ریپلای ۱۰ ثانیه است."
+
+            set_battle_delay(chat_id, low, high)
+
+            return True, "✅ ذخیره شد."
+
+        else:
+
+            return False, "❌ گزینه نامعتبر."
+
+        save_settings()
+
+        return True, "✅ ذخیره شد."
+
+    finally:
+
+        CUR.reset(token)
+
+
+BACKGROUND_TASKS = set()
+
+# هر چند ساعت یک‌بار پشتیبان خودکار برای مالک فرستاده شود (۰ = خاموش)
+AUTO_BACKUP_HOURS = 24
+
+
+async def run_broadcast(sender_id, message, recipients):
+
+    sent = 0
+    failed = 0
+
+    for recipient in recipients:
+
+        try:
+
+            await bot.send_message(recipient, message)
+            sent += 1
+
+        except FloodWaitError as error:
+
+            await asyncio.sleep(error.seconds + 1)
+
+            try:
+                await bot.send_message(recipient, message)
+                sent += 1
+            except Exception:
+                failed += 1
+
+        except Exception:
+
+            failed += 1
+
+        await asyncio.sleep(0.06)
+
+    await notify(
+        sender_id,
+        "📢 ارسال همگانی تمام شد.\n"
+        f"✅ موفق: {sent}\n"
+        f"❌ ناموفق: {failed} (مثلاً کاربرانی که ربات را مسدود کرده‌اند)"
+    )
+
+
+def make_backup_zip():
+
+    path = Path(tempfile.gettempdir()) / f"backup_{time.strftime('%Y%m%d_%H%M%S')}.zip"
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+
+        for item in DATA_DIR.rglob("*"):
+
+            if (
+                item.is_file()
+                and not item.name.startswith("login_bot")
+                and item.suffix != ".tmp"
+            ):
+
+                archive.write(item, item.relative_to(DATA_DIR).as_posix())
+
+    return path
+
+
+async def send_backup(user_id, automatic=False):
+
+    path = make_backup_zip()
+
+    try:
+
+        await bot.send_file(
+            user_id,
+            str(path),
+            caption=(
+                ("🕒 پشتیبان خودکار" if automatic else "📦 پشتیبان")
+                + "\nشامل اکانت‌ها، تنظیمات و کدهاست. Sessionها رمزنگاری‌شده‌اند "
+                "و بدون SESSION_KEY قابل استفاده نیستند؛ آن را جدا نگه دار.\n"
+                "برای بازیابی: پنل مالک ← ♻️ بازیابی"
+            )
+        )
+
+    finally:
+
+        try:
+            path.unlink()
+        except Exception:
+            pass
+
+
+def restore_backup_zip(path):
+
+    if not zipfile.is_zipfile(path):
+        return False, "این فایل zip معتبر نیست."
+
+    root = DATA_DIR.resolve()
+
+    with zipfile.ZipFile(path) as archive:
+
+        names = [name for name in archive.namelist() if not name.endswith("/")]
+
+        if "accounts.json" not in names and "bot_state.json" not in names:
+            return False, "این فایل، پشتیبان این ربات به نظر نمی‌رسد."
+
+        for name in names:
+
+            target = (DATA_DIR / name).resolve()
+
+            if root not in target.parents:
+                return False, "مسیر نامعتبر در فایل."
+
+        for name in names:
+
+            if Path(name).name.startswith("login_bot"):
+                continue
+
+            target = DATA_DIR / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            with archive.open(name) as source, open(target, "wb") as output:
+                shutil.copyfileobj(source, output)
+
+    return True, "OK"
+
+
+async def reload_from_disk():
+
+    for account in list(accounts.values()):
+
+        account.stop_tasks()
+
+        try:
+            await account.client.disconnect()
+        except Exception:
+            pass
+
+    accounts.clear()
+
+    load_bot_state()
+    load_accounts_meta()
+
+    broken = []
+
+    for account_id in list(accounts_meta):
+
+        try:
+
+            account = await start_account(account_id)
+
+            if not account.authorized:
+                broken.append(accounts_meta[account_id].get("name", account_id))
+
+        except Exception as error:
+
+            print("[RELOAD ERROR]", account_id, repr(error))
+            broken.append(accounts_meta[account_id].get("name", account_id))
+
+    return broken
+
+
+async def auto_backup_loop():
+
+    if AUTO_BACKUP_HOURS <= 0:
+        return
+
+    while True:
+
+        await asyncio.sleep(AUTO_BACKUP_HOURS * 3600)
+
+        try:
+            await send_backup(OWNER_ID, automatic=True)
+        except Exception as error:
+            print("[AUTO BACKUP ERROR]", repr(error))
+
+
+def keypad_text(flow, header=None):
+
+    length = flow.get("code_len") or 5
+    digits = flow.get("digits", "")
+
+    slots = max(length, len(digits))
+
+    mask = " ".join(
+        ["●"] * len(digits) + ["○"] * (slots - len(digits))
+    )
+
+    return (
+        f"{header or '🔢 کد ورود'}\n\n"
+        "کد را با دکمه‌های زیر وارد کن:\n\n"
+        f"🔢  {mask}\n\n"
+        "برای لغو: /cancel"
+    )
+
+
+def keypad_buttons():
+
+    def key(label, data):
+        return Button.inline(label, data=data.encode())
+
+    return [
+        [key("1", "kp:1"), key("2", "kp:2"), key("3", "kp:3")],
+        [key("4", "kp:4"), key("5", "kp:5"), key("6", "kp:6")],
+        [key("7", "kp:7"), key("8", "kp:8"), key("9", "kp:9")],
+        [key("⌫", "kp:del"), key("0", "kp:0"), key("✅", "kp:ok")],
+        [key("❌ انصراف", "kp:cancel")]
+    ]
+
+
+async def attempt_code(event, user_id, code):
+
+    flow = flows.get(user_id)
+
+    if not flow or flow.get("step") != "code":
+        return
+
+    temporary = flow["client"]
+    flow["digits"] = ""
+
+    try:
+
+        await temporary.sign_in(
+            phone=flow["phone"],
+            code=code,
+            phone_code_hash=flow["hash"]
+        )
+
+    except SessionPasswordNeededError:
+
+        flow["step"] = "password"
+
+        await event.respond("🔐 رمز تأیید دومرحله‌ای را بفرست.")
+        return
+
+    except PhoneCodeInvalidError:
+
+        await event.respond(
+            keypad_text(flow, "❌ کد اشتباه بود. دوباره وارد کن."),
+            buttons=keypad_buttons()
+        )
+        return
+
+    except PhoneCodeExpiredError:
+
+        await clear_flow(user_id)
+        await event.respond("⌛ کد منقضی شد. دوباره از /start شروع کن.")
+        return
+
+    except Exception as error:
+
+        await event.respond(f"❌ خطا: {error}")
+        return
+
+    await finish_login(event, user_id)
+
+
 async def dispatch_callback(event, user_id, action, argument):
 
     """اگر رشته‌ای برگرداند، به‌صورت هشدار به کاربر نشان داده می‌شود."""
@@ -3631,6 +4732,196 @@ async def dispatch_callback(event, user_id, action, argument):
             "📱 شماره اکانت را با کد کشور بفرست.\n"
             "مثال: +989121234567\n\nبرای لغو: /cancel"
         )
+        return None
+
+    if action == "spm":
+
+        owned = accounts_of(user_id)
+
+        if not owned:
+            return "هنوز اکانتی وصل نکرده‌ای."
+
+        if len(owned) == 1:
+
+            text, rows = groups_panel(owned[0])
+
+        else:
+
+            text = "⚙️ پنل سلف\n\nیکی از اکانت‌هایت را انتخاب کن:"
+
+            rows = [
+                [Button.inline(
+                    f"👤 {accounts_meta[item].get('name', item)}",
+                    data=f"spa:{item}".encode()
+                )]
+                for item in owned
+            ] + [back_button()]
+
+        await show(event, text, rows)
+        return None
+
+    if action == "spa":
+
+        if owned_account(user_id, argument) is None:
+            return "این اکانت مال تو نیست یا وجود ندارد."
+
+        text, rows = groups_panel(argument)
+        await show(event, text, rows)
+        return None
+
+    if action == "spg":
+
+        account_id, _, chat_key = argument.partition(":")
+
+        if owned_account(user_id, account_id) is None:
+            return "این اکانت مال تو نیست یا وجود ندارد."
+
+        text, rows = group_panel(account_id, chat_key)
+        await show(event, text, rows)
+        return None
+
+    if action == "spo":
+
+        op, _, rest = argument.partition(":")
+        account_id, _, chat_key = rest.partition(":")
+
+        account = owned_account(user_id, account_id)
+
+        if account is None:
+            return "این اکانت مال تو نیست یا وجود ندارد."
+
+        if chat_key not in account.settings:
+            return "این گروه دیگر وجود ندارد."
+
+        chat_id = int(chat_key)
+
+        if op in PANEL_PROMPTS:
+
+            await clear_flow(user_id)
+
+            flows[user_id] = {
+                "step": "pset",
+                "account_id": account_id,
+                "chat_key": chat_key,
+                "field": op
+            }
+
+            await event.respond(PANEL_PROMPTS[op] + "\n\nبرای لغو: /cancel")
+            return None
+
+        token = CUR.set(account)
+
+        try:
+
+            config = get_settings(chat_id)
+
+            if op == "go":
+
+                if not account.authorized or not account.is_active():
+                    return "سلف الان خاموش یا منقضی است."
+
+                task = account.tasks.get(chat_id)
+
+                if task is None or task.done():
+
+                    account.tasks[chat_id] = asyncio.create_task(
+                        automatic_loop(chat_id)
+                    )
+
+                config["running"] = True
+                save_settings()
+
+            elif op == "off":
+
+                task = account.tasks.get(chat_id)
+
+                if task is not None and not task.done():
+                    task.cancel()
+
+                config["running"] = False
+                save_settings()
+
+            elif op == "mode":
+
+                current = config.get("check_mode", "both")
+                position = MODE_ORDER.index(current) if current in MODE_ORDER else 0
+
+                config["check_mode"] = MODE_ORDER[(position + 1) % len(MODE_ORDER)]
+                save_settings()
+
+            elif op == "hourly":
+
+                config["hourly"] = not config.get("hourly", False)
+                save_settings()
+                get_interval_event(chat_id).set()
+
+            elif op == "energy":
+
+                config["energy"] = not config.get("energy", False)
+                save_settings()
+
+        finally:
+
+            CUR.reset(token)
+
+        text, rows = group_panel(account_id, chat_key)
+        await show(event, text, rows)
+        return None
+
+    if action == "kp":
+
+        flow = flows.get(user_id)
+
+        if not flow or flow.get("step") != "code":
+            return "این مرحله منقضی شده؛ دوباره از /start شروع کن."
+
+        digits = flow.get("digits", "")
+
+        if argument == "cancel":
+
+            await clear_flow(user_id)
+
+            text, rows = menu_for(user_id)
+            await show(event, text, rows)
+            return None
+
+        if argument == "ok":
+
+            if not digits:
+                return "اول کد را وارد کن."
+
+            await attempt_code(event, user_id, digits)
+            return None
+
+        if argument == "del":
+
+            if not digits:
+                return None
+
+            digits = digits[:-1]
+
+        elif argument.isdigit() and len(argument) == 1:
+
+            if len(digits) >= 8:
+                return None
+
+            digits += argument
+
+        else:
+
+            return None
+
+        flow["digits"] = digits
+
+        code_len = flow.get("code_len")
+
+        # وقتی تعداد ارقام کد به طول واقعی رسید، خودکار ارسال می‌شود
+        if code_len and len(digits) == code_len:
+
+            await attempt_code(event, user_id, digits)
+            return None
+
+        await show(event, keypad_text(flow), keypad_buttons())
         return None
 
     if action == "udel":
@@ -3701,6 +4992,9 @@ async def dispatch_callback(event, user_id, action, argument):
             meta["enabled"] = True
             save_accounts_meta()
 
+            if argument in accounts:
+                resume_account(accounts[argument])
+
         text, rows = account_panel(argument, role)
         await show(event, text, rows)
         return None
@@ -3717,6 +5011,55 @@ async def dispatch_callback(event, user_id, action, argument):
         )
         return None
 
+    if action == "bc":
+
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "broadcast"}
+
+        await event.respond(
+            "📢 پیام همگانی\n\n"
+            "پیام یا فایل را بفرست (متن، عکس، ویدیو، فایل، ...).\n"
+            f"برای همه‌ی کسانی که ربات را استارت کرده‌اند ({max(len(STATE['users']) - 1, 0)} نفر) ارسال می‌شود.\n"
+            "برای لغو: /cancel"
+        )
+        return None
+
+    if action == "bc_ok":
+
+        flow = flows.get(user_id)
+
+        if not flow or flow.get("step") != "broadcast_confirm":
+            return "این مرحله منقضی شده؛ دوباره از پنل شروع کن."
+
+        message = flow["message"]
+
+        recipients = [
+            int(key)
+            for key in STATE["users"]
+            if int(key) != user_id
+        ]
+
+        flows.pop(user_id, None)
+
+        task = asyncio.create_task(run_broadcast(user_id, message, recipients))
+        BACKGROUND_TASKS.add(task)
+        task.add_done_callback(BACKGROUND_TASKS.discard)
+
+        await show(
+            event,
+            f"📤 ارسال برای {len(recipients)} کاربر شروع شد. بعد از پایان گزارش می‌دهم.",
+            [back_button()]
+        )
+        return None
+
+    if action == "bc_no":
+
+        await clear_flow(user_id)
+
+        text, rows = menu_for(user_id)
+        await show(event, text, rows)
+        return None
+
     # ---------- فقط مالک ----------
 
     if not is_owner:
@@ -3725,6 +5068,24 @@ async def dispatch_callback(event, user_id, action, argument):
     if action == "addown":
 
         await start_purpose(event, user_id, {"kind": "owner"})
+        return None
+
+    if action == "backup":
+
+        await send_backup(user_id)
+        return None
+
+    if action == "restore":
+
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "restore"}
+
+        await event.respond(
+            "♻️ فایل پشتیبان (zip) را بفرست.\n"
+            "⚠️ اطلاعات فعلی با محتوای فایل جایگزین می‌شود. "
+            "SESSION_KEY باید همان کلید زمان پشتیبان باشد.\n"
+            "برای لغو: /cancel"
+        )
         return None
 
     if action == "gtog":
@@ -3736,6 +5097,11 @@ async def dispatch_callback(event, user_id, action, argument):
 
             for account in accounts.values():
                 account.stop_tasks()
+
+        else:
+
+            for account in accounts.values():
+                resume_account(account)
 
         text, rows = owner_menu()
         await show(event, text, rows)
@@ -4013,54 +5379,20 @@ async def bot_message_handler(event):
 
         await safe_delete(event)
 
+        flow["code_len"] = getattr(getattr(sent, "type", None), "length", None)
+        flow["digits"] = ""
+
         await event.respond(
-            "📨 کد به تلگرام اکانت ارسال شد.\n\n"
-            "⚠️ کد را با خط تیره یا فاصله بفرست، مثلاً: 1-2-3-4-5\n"
-            "(اگر کد را پشت‌سرهم بفرستی تلگرام آن را باطل می‌کند)\n\n"
-            "برای لغو: /cancel"
+            keypad_text(flow, "📨 کد به تلگرام اکانت ارسال شد."),
+            buttons=keypad_buttons()
         )
         return
 
-    # ---------- code ----------
+    # ---------- code (تایپی؛ راه جایگزین دکمه‌های شیشه‌ای) ----------
 
     if step == "code":
 
-        code = only_digits(text)
-        temporary = flow["client"]
-
-        try:
-
-            await temporary.sign_in(
-                phone=flow["phone"],
-                code=code,
-                phone_code_hash=flow["hash"]
-            )
-
-        except SessionPasswordNeededError:
-
-            flow["step"] = "password"
-
-            await safe_delete(event)
-            await event.respond("🔐 رمز تأیید دومرحله‌ای را بفرست.")
-            return
-
-        except PhoneCodeInvalidError:
-
-            await event.respond("❌ کد اشتباه است. دوباره بفرست.")
-            return
-
-        except PhoneCodeExpiredError:
-
-            await clear_flow(user_id)
-            await event.respond("⌛ کد منقضی شد. دوباره از /start شروع کن.")
-            return
-
-        except Exception as error:
-
-            await event.respond(f"❌ خطا: {error}")
-            return
-
-        await finish_login(event, user_id)
+        await attempt_code(event, user_id, only_digits(text))
         return
 
     # ---------- 2FA password ----------
@@ -4129,6 +5461,100 @@ async def bot_message_handler(event):
         )
         return
 
+    # ---------- مقدار تایپ‌شده در پنل سلف ----------
+
+    if step == "pset":
+
+        account = owned_account(user_id, flow.get("account_id"))
+
+        if account is None:
+
+            await clear_flow(user_id)
+            await event.respond("این اکانت دیگر وجود ندارد. /start")
+            return
+
+        ok, message = apply_panel_input(
+            account,
+            flow["chat_key"],
+            flow["field"],
+            text
+        )
+
+        if not ok:
+
+            await event.respond(message)
+            return
+
+        account_id = flow["account_id"]
+        chat_key = flow["chat_key"]
+
+        await clear_flow(user_id)
+
+        panel_text, rows = group_panel(account_id, chat_key)
+
+        await event.respond(f"{message}\n\n{panel_text}", buttons=rows)
+        return
+
+    # ---------- پیام همگانی ----------
+
+    if step == "broadcast" and role in ("owner", "admin"):
+
+        recipients = [
+            int(key)
+            for key in STATE["users"]
+            if int(key) != user_id
+        ]
+
+        flow.update(step="broadcast_confirm", message=event.message)
+
+        await event.reply(
+            f"📢 این پیام برای {len(recipients)} کاربر ارسال شود؟",
+            buttons=[[
+                Button.inline("✅ ارسال", data=b"bc_ok"),
+                Button.inline("❌ لغو", data=b"bc_no")
+            ]]
+        )
+        return
+
+    # ---------- بازیابی پشتیبان ----------
+
+    if step == "restore" and role == "owner":
+
+        if event.message.document is None:
+
+            await event.respond("❌ فایل zip پشتیبان را بفرست.")
+            return
+
+        path = Path(tempfile.gettempdir()) / "restore_backup.zip"
+
+        await event.message.download_media(file=str(path))
+
+        ok, info = restore_backup_zip(path)
+
+        try:
+            path.unlink()
+        except Exception:
+            pass
+
+        await clear_flow(user_id)
+
+        if not ok:
+
+            await event.respond(f"❌ {info}", buttons=[back_button()])
+            return
+
+        await event.respond("♻️ فایل بازیابی شد؛ اکانت‌ها دوباره راه‌اندازی می‌شوند...")
+
+        broken = await reload_from_disk()
+
+        message = f"✅ بازیابی کامل شد. اکانت‌ها: {len(accounts_meta)}"
+
+        if broken:
+            message += "\n⚠️ نیاز به ورود مجدد: " + "، ".join(broken)
+
+        await event.respond(message, buttons=[back_button()])
+        return
+
     # ---------- فقط مالک ----------
 
     if role == "owner" and step == "days":
@@ -4174,6 +5600,9 @@ async def bot_message_handler(event):
 
         meta["enabled"] = True
         save_accounts_meta()
+
+        if account_id in accounts:
+            resume_account(accounts[account_id])
 
         await clear_flow(user_id)
 
@@ -4303,6 +5732,7 @@ async def main():
             broken.append(accounts_meta[account_id].get("name", account_id))
 
     watcher = asyncio.create_task(expiry_watcher())
+    backup_task = asyncio.create_task(auto_backup_loop())
 
     message = (
         f"✅ سرویس بالا آمد. تعداد اکانت‌ها: {len(accounts_meta)}/{MAX_ACCOUNTS}\n"
@@ -4325,6 +5755,7 @@ async def main():
     finally:
 
         watcher.cancel()
+        backup_task.cancel()
 
 
 if __name__ == "__main__":
