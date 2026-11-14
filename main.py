@@ -1,5 +1,6 @@
 import asyncio
 import contextvars
+import secrets
 import shutil
 import json
 import base64
@@ -12,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 
 from telethon import TelegramClient, events, connection, Button
+from telethon.sessions import StringSession
+from cryptography.fernet import Fernet
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -30,6 +33,17 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])  # آیدی عددی خودت
+OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "").strip()  # مثلاً @myid
+MAX_ACCOUNTS = int(os.environ.get("MAX_ACCOUNTS", "20"))
+
+# کلید رمزنگاری Sessionها. ساخت: python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"
+try:
+    FERNET = Fernet(os.environ["SESSION_KEY"].encode())
+except Exception:
+    raise SystemExit("SESSION_KEY تنظیم نشده یا نامعتبر است.")
+
+if OWNER_USERNAME and not OWNER_USERNAME.startswith("@"):
+    OWNER_USERNAME = "@" + OWNER_USERNAME
 
 # مسیر Volume در Railway
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
@@ -61,11 +75,7 @@ class Account:
         self.dir = ACCOUNTS_DIR / account_id
         self.dir.mkdir(parents=True, exist_ok=True)
 
-        self.client = client or TelegramClient(
-            str(self.dir / "session"),
-            API_ID,
-            API_HASH
-        )
+        self.client = client
 
         self.authorized = False
         self.handlers_attached = False
@@ -89,7 +99,7 @@ class Account:
 
         meta = self.meta
 
-        if not meta.get("enabled", False):
+        if STATE.get("global_off") or not meta.get("enabled", False):
             return False
 
         expires_at = meta.get("expires_at")
@@ -2271,48 +2281,200 @@ async def battle_command_handler(event):
 # =========================================================
 # 13. MULTI-ACCOUNT MANAGER
 # =========================================================
-# هر اکانت: Session، تنظیمات، تسک‌ها و تاریخچه‌ی قیمت جداگانه دارد.
-# ادمین فقط «سلف» هر اکانت را مدیریت می‌کند (روشن/خاموش/مدت)؛
-# به پیام‌ها و چت‌های اکانت‌ها هیچ دسترسی‌ای ندارد.
+# هر اکانت: Session (رمزنگاری‌شده)، تنظیمات، تسک‌ها و تاریخچه‌ی قیمت جداگانه دارد.
+# پنل‌ها فقط «سلف» را کنترل می‌کنند (روشن/خاموش/مدت)، نه پیام‌ها و چت‌های اکانت‌ها.
 
-def bind(account, handler):
+STATE_FILE = DATA_DIR / "bot_state.json"
 
-    async def wrapper(event):
 
-        token = CUR.set(account)
+def default_state():
+
+    return {
+        "admins": [],
+        "global_off": False,
+        "users": {},
+        "codes": {},
+        "requests": {}
+    }
+
+
+STATE = default_state()
+
+flows = {}  # شناسه‌ی کاربر ربات -> وضعیت مرحله‌ی فعلی او
+
+
+def load_bot_state():
+
+    global STATE
+
+    STATE = default_state()
+
+    try:
+
+        if STATE_FILE.exists():
+
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+
+            if isinstance(data, dict):
+
+                for key, value in data.items():
+                    STATE[key] = value
+
+    except Exception as error:
+
+        print("[STATE LOAD ERROR]", repr(error))
+
+
+def save_bot_state():
+
+    temporary = STATE_FILE.with_suffix(".tmp")
+
+    temporary.write_text(
+        json.dumps(STATE, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+    temporary.replace(STATE_FILE)
+
+
+# ---------------------------------------------------------
+# SESSION ENCRYPTION
+# ---------------------------------------------------------
+
+def save_session_string(account_id, value):
+
+    folder = ACCOUNTS_DIR / account_id
+    folder.mkdir(parents=True, exist_ok=True)
+
+    path = folder / "session.enc"
+    temporary = path.with_suffix(".tmp")
+
+    temporary.write_bytes(FERNET.encrypt(value.encode("utf-8")))
+    temporary.replace(path)
+
+
+async def load_session_string(account_id):
+
+    folder = ACCOUNTS_DIR / account_id
+    encrypted = folder / "session.enc"
+
+    if encrypted.exists():
+
+        return FERNET.decrypt(encrypted.read_bytes()).decode("utf-8")
+
+    # Session قدیمی (SQLite) -> تبدیل به نسخه‌ی رمزنگاری‌شده
+    legacy = folder / "session.session"
+
+    if not legacy.exists():
+        return ""
+
+    old_client = TelegramClient(str(folder / "session"), API_ID, API_HASH)
+
+    try:
+
+        await old_client.connect()
+
+        if not await old_client.is_user_authorized():
+            return ""
+
+        value = StringSession.save(old_client.session)
+
+    finally:
+
+        await old_client.disconnect()
+
+    save_session_string(account_id, value)
+
+    for suffix in ("session.session", "session.session-journal"):
 
         try:
+            (folder / suffix).unlink()
+        except FileNotFoundError:
+            pass
 
-            # سلف خاموش یا مدت تمام‌شده: هیچ دستوری اجرا نمی‌شود
-            if not account.is_active():
-                return
+    print(f"[SESSION] {account_id}: legacy session encrypted")
 
-            await handler(event)
-
-        finally:
-
-            CUR.reset(token)
-
-    return wrapper
+    return value
 
 
-def attach_handlers(account):
+# ---------------------------------------------------------
+# ROLES / USERS
+# ---------------------------------------------------------
 
-    if account.handlers_attached:
-        return
+def role_of(user_id):
 
-    account.client.add_event_handler(
-        bind(account, command_handler),
-        events.NewMessage(outgoing=True, pattern=COMMAND_PATTERN)
-    )
+    if user_id == OWNER_ID:
+        return "owner"
 
-    account.client.add_event_handler(
-        bind(account, battle_command_handler),
-        events.NewMessage(outgoing=True, pattern=BATTLE_PATTERN)
-    )
+    if user_id in STATE["admins"]:
+        return "admin"
 
-    account.handlers_attached = True
+    return "user"
 
+
+def get_user(user_id):
+
+    key = str(user_id)
+
+    if key not in STATE["users"]:
+
+        STATE["users"][key] = {
+            "name": "",
+            "username": "",
+            "trial_used": False,
+            "entitled_days": 0,
+            "joined": int(time.time())
+        }
+
+    return STATE["users"][key]
+
+
+async def touch_user(event):
+
+    try:
+
+        sender = await event.get_sender()
+
+        user = get_user(event.sender_id)
+
+        name = getattr(sender, "first_name", "") or ""
+        username = getattr(sender, "username", "") or ""
+
+        if user.get("name") != name or user.get("username") != username:
+
+            user["name"] = name
+            user["username"] = username
+
+        save_bot_state()
+
+    except Exception as error:
+
+        print("[TOUCH USER ERROR]", repr(error))
+
+
+def user_label(user_id):
+
+    user = STATE["users"].get(str(user_id), {})
+
+    name = user.get("name") or str(user_id)
+    username = user.get("username")
+
+    return f"{name} (@{username})" if username else f"{name} [{user_id}]"
+
+
+def find_user_account(user_id):
+
+    for account_id, meta in accounts_meta.items():
+
+        if meta.get("kind") == "user" and meta.get("bot_user") == user_id:
+            return account_id
+
+    return None
+
+
+# ---------------------------------------------------------
+# ACCOUNT HELPERS
+# ---------------------------------------------------------
 
 def load_accounts_meta():
 
@@ -2377,6 +2539,8 @@ def migrate_legacy():
     accounts_meta["a1"] = {
         "name": "اکانت اصلی",
         "user_id": None,
+        "kind": "owner",
+        "bot_user": OWNER_ID,
         "enabled": True,
         "expires_at": None,
         "created": int(time.time())
@@ -2415,6 +2579,16 @@ def load_account_state(account):
 
 async def start_account(account_id, account_client=None):
 
+    if account_client is None:
+
+        session_string = await load_session_string(account_id)
+
+        account_client = TelegramClient(
+            StringSession(session_string),
+            API_ID,
+            API_HASH
+        )
+
     account = Account(account_id, account_client)
     accounts[account_id] = account
 
@@ -2431,6 +2605,70 @@ async def start_account(account_id, account_client=None):
     return account
 
 
+async def remove_account(account_id):
+
+    account = accounts.pop(account_id, None)
+
+    if account is not None:
+
+        account.stop_tasks()
+
+        try:
+            if await account.client.is_user_authorized():
+                await account.client.log_out()
+        except Exception as error:
+            print("[REMOVE LOGOUT ERROR]", repr(error))
+
+        try:
+            await account.client.disconnect()
+        except Exception:
+            pass
+
+    accounts_meta.pop(account_id, None)
+    save_accounts_meta()
+
+    shutil.rmtree(ACCOUNTS_DIR / account_id, ignore_errors=True)
+
+
+def bind(account, handler):
+
+    async def wrapper(event):
+
+        token = CUR.set(account)
+
+        try:
+
+            # سلف خاموش، مدت تمام‌شده یا خاموشی کلی: هیچ دستوری اجرا نمی‌شود
+            if not account.is_active():
+                return
+
+            await handler(event)
+
+        finally:
+
+            CUR.reset(token)
+
+    return wrapper
+
+
+def attach_handlers(account):
+
+    if account.handlers_attached:
+        return
+
+    account.client.add_event_handler(
+        bind(account, command_handler),
+        events.NewMessage(outgoing=True, pattern=COMMAND_PATTERN)
+    )
+
+    account.client.add_event_handler(
+        bind(account, battle_command_handler),
+        events.NewMessage(outgoing=True, pattern=BATTLE_PATTERN)
+    )
+
+    account.handlers_attached = True
+
+
 def remaining_text(meta):
 
     expires_at = meta.get("expires_at")
@@ -2443,7 +2681,12 @@ def remaining_text(meta):
     if remaining <= 0:
         return "منقضی"
 
-    return f"{math.ceil(remaining / 86400)} روز"
+    days = remaining / 86400
+
+    if days < 1:
+        return f"{math.ceil(remaining / 3600)} ساعت"
+
+    return f"{math.ceil(days)} روز"
 
 
 def status_icon(account_id):
@@ -2457,6 +2700,26 @@ def status_icon(account_id):
         return "⚠️"
 
     return "🟢" if account.is_active() else "🔴"
+
+
+def status_text(account_id):
+
+    account = accounts.get(account_id)
+    meta = accounts_meta.get(account_id, {})
+
+    if account is not None and not account.authorized:
+        return "⚠️ نیاز به ورود مجدد"
+
+    if STATE.get("global_off"):
+        return "⛔ خاموشی کلی توسط مالک"
+
+    if account is not None and account.is_active():
+        return "🟢 فعال"
+
+    if meta.get("enabled"):
+        return "⏰ منقضی شده"
+
+    return "🔴 خاموش"
 
 
 def disable_account(account_id):
@@ -2473,6 +2736,36 @@ def disable_account(account_id):
 
     if account is not None:
         account.stop_tasks()
+
+
+def apply_grant(account_id, days):
+
+    """days روز به سلف اکانت اضافه می‌کند و آن را روشن می‌کند."""
+
+    meta = accounts_meta[account_id]
+    now = time.time()
+    expires_at = meta.get("expires_at")
+
+    if meta.get("enabled") and expires_at and expires_at > now:
+        base = expires_at
+    else:
+        base = now
+
+    meta["expires_at"] = int(base + days * 86400)
+    meta["enabled"] = True
+
+    save_accounts_meta()
+
+
+async def notify(user_id, text, buttons=None):
+
+    try:
+
+        await bot.send_message(user_id, text, buttons=buttons)
+
+    except Exception as error:
+
+        print("[NOTIFY ERROR]", user_id, repr(error))
 
 
 async def expiry_watcher():
@@ -2493,23 +2786,146 @@ async def expiry_watcher():
 
                     disable_account(account_id)
 
-                    await bot.send_message(
+                    name = meta.get("name", account_id)
+
+                    await notify(
                         OWNER_ID,
-                        f"⏰ مدت اکانت «{meta.get('name', account_id)}» تمام شد.\n"
-                        "سلف این اکانت خاموش شد. برای روشن شدن، مدت را تمدید کن: /panel"
+                        f"⏰ مدت اکانت «{name}» تمام شد و سلفش خاموش شد."
                     )
+
+                    holder = meta.get("bot_user")
+
+                    if meta.get("kind") == "user" and holder:
+
+                        await notify(
+                            holder,
+                            "⏰ مدت سلف تو تمام شد.\n"
+                            "برای ادامه از /start «خرید سلف» یا «کد ویژه» را بزن."
+                        )
 
         except Exception as error:
 
             print("[EXPIRY WATCHER ERROR]", repr(error))
 
 
-# =========================================================
-# 14. ADMIN PANEL (داخل همین ربات)
-# =========================================================
+# ---------------------------------------------------------
+# SPECIAL CODES / PURPOSES
+# ---------------------------------------------------------
 
-flow = {"step": None}
+def normalize_code(text):
 
+    return re.sub(r"[^A-Z0-9]", "", normalize_digits(text or "").upper())
+
+
+def make_code():
+
+    raw = secrets.token_hex(4).upper()
+
+    return f"{raw[:4]}-{raw[4:]}"
+
+
+def find_code(text):
+
+    wanted = normalize_code(text)
+
+    for code, info in STATE["codes"].items():
+
+        if normalize_code(code) == wanted:
+            return code, info
+
+    return None, None
+
+
+def validate_purpose(user_id, purpose):
+
+    """(days, خطا) را برمی‌گرداند. هیچ چیزی را مصرف نمی‌کند."""
+
+    kind = purpose["kind"]
+
+    if kind == "owner":
+        return None, None
+
+    user = get_user(user_id)
+
+    if kind == "trial":
+
+        if user.get("trial_used"):
+            return None, "❌ اشتراک تست یک‌روزه را قبلاً استفاده کرده‌ای."
+
+        return 1, None
+
+    if kind == "code":
+
+        code, info = find_code(purpose.get("code", ""))
+
+        if info is None:
+            return None, "❌ این کد وجود ندارد."
+
+        if info.get("used_by"):
+            return None, "❌ این کد قبلاً استفاده شده است."
+
+        return int(info["days"]), None
+
+    if kind == "buy":
+
+        days = int(user.get("entitled_days", 0))
+
+        if days <= 0:
+            return None, "❌ خرید تأییدشده‌ای برای تو ثبت نشده است."
+
+        return days, None
+
+    return None, "❌ درخواست نامعتبر است."
+
+
+def commit_purpose(user_id, purpose):
+
+    kind = purpose["kind"]
+    user = get_user(user_id)
+
+    if kind == "trial":
+
+        user["trial_used"] = True
+
+    elif kind == "code":
+
+        code, info = find_code(purpose.get("code", ""))
+
+        if info is not None:
+
+            info["used_by"] = user_id
+            info["used_at"] = int(time.time())
+
+    elif kind == "buy":
+
+        user["entitled_days"] = 0
+
+    save_bot_state()
+
+
+# ---------------------------------------------------------
+# PURCHASE REQUESTS
+# ---------------------------------------------------------
+
+def new_request_id():
+
+    numbers = [int(key) for key in STATE["requests"] if key.isdigit()]
+
+    return str(max(numbers, default=0) + 1)
+
+
+def pending_requests():
+
+    return {
+        key: value
+        for key, value in STATE["requests"].items()
+        if value.get("status") == "pending"
+    }
+
+
+# =========================================================
+# 14. PANELS (کاربر / ادمین / مالک)
+# =========================================================
 
 def only_digits(text):
 
@@ -2532,40 +2948,153 @@ async def show(event, text, buttons):
         await event.respond(text, buttons=buttons)
 
 
-async def reset_flow():
+async def clear_flow(user_id):
 
-    temporary = flow.get("client")
-    account_id = flow.get("account_id")
+    flow = flows.pop(user_id, None)
 
-    if temporary is not None:
+    if flow and flow.get("client") is not None:
 
         try:
-            await temporary.disconnect()
+            await flow["client"].disconnect()
         except Exception:
             pass
 
-        if account_id and account_id not in accounts_meta:
-            shutil.rmtree(ACCOUNTS_DIR / account_id, ignore_errors=True)
 
-    flow.clear()
-    flow["step"] = None
+def back_button(data=b"menu"):
+
+    return [Button.inline("⬅️ بازگشت", data=data)]
 
 
-def main_panel():
+# ---------------------------------------------------------
+# USER MENU
+# ---------------------------------------------------------
+
+def user_menu(user_id):
+
+    rows = [
+        [Button.inline("🎁 اشتراک تست یک‌روزه", data=b"trial")],
+        [Button.inline("🔑 استفاده از کد ویژه", data=b"usecode")],
+        [Button.inline("🛒 خرید سلف", data=b"buy")]
+    ]
+
+    if find_user_account(user_id):
+
+        rows.append([Button.inline("📊 وضعیت من", data=b"status")])
+
+    text = (
+        "👋 به ربات سلف خوش آمدی.\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "یکی از گزینه‌ها را انتخاب کن:"
+    )
+
+    return text, rows
+
+
+def user_status_panel(user_id):
+
+    account_id = find_user_account(user_id)
+
+    if account_id is None:
+        return user_menu(user_id)
+
+    meta = accounts_meta[account_id]
+
+    text = (
+        "📊 وضعیت سلف تو\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"وضعیت: {status_text(account_id)}\n"
+        f"مدت باقی‌مانده: {remaining_text(meta)}"
+    )
+
+    rows = [
+        [Button.inline("🗑 حذف اکانت من", data=b"udel")],
+        back_button()
+    ]
+
+    return text, rows
+
+
+# ---------------------------------------------------------
+# ADMIN / OWNER MENUS
+# ---------------------------------------------------------
+
+def admin_menu():
+
+    rows = [
+        [Button.inline(f"📋 اکانت‌ها ({len(accounts_meta)}/{MAX_ACCOUNTS})", data=b"accs")],
+        [Button.inline("🎟 ساخت کد ویژه", data=b"newcode")]
+    ]
+
+    text = (
+        "🛡 پنل ادمین\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "می‌توانی سلف اکانت‌ها را خاموش/روشن کنی و کد ویژه بسازی."
+    )
+
+    return text, rows
+
+
+def owner_menu():
+
+    pending = len(pending_requests())
+
+    global_label = (
+        "🟢 روشن کردن سلف روی همه"
+        if STATE.get("global_off")
+        else "🔴 خاموش کردن سلف روی همه"
+    )
+
+    rows = [
+        [
+            Button.inline(f"📋 اکانت‌ها ({len(accounts_meta)}/{MAX_ACCOUNTS})", data=b"accs"),
+            Button.inline("➕ افزودن اکانت من", data=b"addown")
+        ],
+        [
+            Button.inline(f"🛒 درخواست‌های خرید ({pending})", data=b"rqlist"),
+            Button.inline("🎟 ساخت کد ویژه", data=b"newcode")
+        ],
+        [
+            Button.inline(f"👮 ادمین‌ها ({len(STATE['admins'])})", data=b"admins"),
+            Button.inline("📜 کدها", data=b"codes")
+        ],
+        [Button.inline(global_label, data=b"gtog")]
+    ]
+
+    text = (
+        "👑 پنل مالک\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"سلف کلی: {'⛔ خاموش' if STATE.get('global_off') else '🟢 روشن'}\n"
+        f"ظرفیت اکانت‌ها: {len(accounts_meta)}/{MAX_ACCOUNTS}\n"
+        f"درخواست خرید در انتظار: {pending}"
+    )
+
+    return text, rows
+
+
+def menu_for(user_id):
+
+    role = role_of(user_id)
+
+    if role == "owner":
+        return owner_menu()
+
+    if role == "admin":
+        return admin_menu()
+
+    return user_menu(user_id)
+
+
+def accounts_panel():
 
     lines = [
-        "🎛 پنل مدیریت اکانت‌ها",
-        "━━━━━━━━━━━━━━━━━━"
+        "📋 اکانت‌ها",
+        "━━━━━━━━━━━━━━━━━━",
+        f"ظرفیت: {len(accounts_meta)}/{MAX_ACCOUNTS}",
+        "🟢 فعال   🔴 خاموش   ⚠️ نیاز به ورود مجدد"
     ]
 
     if not accounts_meta:
-
-        lines.append("هنوز اکانتی اضافه نشده است.")
-
-    else:
-
-        lines.append(f"تعداد اکانت‌ها: {len(accounts_meta)}")
-        lines.append("🟢 فعال   🔴 خاموش   ⚠️ نیاز به ورود مجدد")
+        lines.append("\nهنوز اکانتی وصل نشده است.")
 
     rows = []
 
@@ -2578,17 +3107,17 @@ def main_panel():
             )
         ])
 
-    rows.append([Button.inline("➕ افزودن اکانت", data=b"add")])
+    rows.append(back_button())
 
     return "\n".join(lines), rows
 
 
-def account_panel(account_id):
+def account_panel(account_id, role):
 
     meta = accounts_meta.get(account_id)
 
     if meta is None:
-        return main_panel()
+        return accounts_panel()
 
     account = accounts.get(account_id)
 
@@ -2603,15 +3132,6 @@ def account_panel(account_id):
             if not task.done()
         )
 
-    if account is not None and not account.authorized:
-        status = "⚠️ نیاز به ورود مجدد (حذف کن و دوباره اضافه کن)"
-    elif account is not None and account.is_active():
-        status = "🟢 فعال"
-    elif meta.get("enabled"):
-        status = "⏰ منقضی شده"
-    else:
-        status = "🔴 خاموش"
-
     expires_at = meta.get("expires_at")
 
     end_text = (
@@ -2624,7 +3144,8 @@ def account_panel(account_id):
         f"👤 {meta.get('name', '?')}\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"شناسه داخلی: {account_id}\n"
-        f"وضعیت سلف: {status}\n"
+        f"نوع: {'مالک' if meta.get('kind', 'owner') == 'owner' else 'کاربر'}\n"
+        f"وضعیت سلف: {status_text(account_id)}\n"
         f"مدت باقی‌مانده: {remaining_text(meta)}\n"
         f"پایان مدت: {end_text}\n"
         f"عملیات در حال اجرا: {running}"
@@ -2636,130 +3157,482 @@ def account_panel(account_id):
         else "🟢 روشن کردن سلف"
     )
 
-    rows = [
-        [Button.inline(toggle_label, data=f"tog:{account_id}".encode())],
-        [
+    rows = [[Button.inline(toggle_label, data=f"tog:{account_id}".encode())]]
+
+    if role == "owner":
+
+        rows.append([
             Button.inline("⏳ تنظیم مدت", data=f"days:{account_id}".encode()),
             Button.inline("➕ تمدید", data=f"ext:{account_id}".encode())
-        ],
-        [Button.inline("🗑 حذف اکانت", data=f"del:{account_id}".encode())],
-        [Button.inline("⬅️ بازگشت", data=b"list")]
-    ]
+        ])
+
+        rows.append([
+            Button.inline("🗑 حذف اکانت", data=f"del:{account_id}".encode())
+        ])
+
+    rows.append(back_button(b"accs"))
 
     return text, rows
 
 
-async def begin_add(event):
+def requests_panel():
 
-    await reset_flow()
+    pending = pending_requests()
 
-    flow.update(step="phone", account_id=new_account_id())
+    lines = [
+        "🛒 درخواست‌های خرید",
+        "━━━━━━━━━━━━━━━━━━"
+    ]
+
+    if not pending:
+        lines.append("درخواستی در انتظار نیست.")
+
+    rows = []
+
+    for request_id, info in pending.items():
+
+        rows.append([
+            Button.inline(
+                f"#{request_id} • {user_label(info['uid'])}",
+                data=f"rq:{request_id}".encode()
+            )
+        ])
+
+    rows.append(back_button())
+
+    return "\n".join(lines), rows
+
+
+def request_panel(request_id):
+
+    info = STATE["requests"].get(request_id)
+
+    if info is None:
+        return requests_panel()
+
+    text = (
+        f"🛒 درخواست خرید #{request_id}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"کاربر: {user_label(info['uid'])}\n"
+        f"آیدی عددی: {info['uid']}\n"
+        f"زمان: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(info['time']))}\n"
+        f"وضعیت: {info['status']}"
+    )
+
+    rows = []
+
+    if info["status"] == "pending":
+
+        rows.append([
+            Button.inline("✅ تایید و تعیین مدت", data=f"rq_ok:{request_id}".encode()),
+            Button.inline("❌ رد", data=f"rq_no:{request_id}".encode())
+        ])
+
+    rows.append(back_button(b"rqlist"))
+
+    return text, rows
+
+
+def admins_panel():
+
+    lines = [
+        "👮 ادمین‌ها",
+        "━━━━━━━━━━━━━━━━━━",
+        "ادمین فقط می‌تواند سلف اکانت‌ها را خاموش/روشن کند و کد ویژه بسازد."
+    ]
+
+    if not STATE["admins"]:
+        lines.append("\nهنوز ادمینی تعیین نشده است.")
+
+    rows = []
+
+    for admin_id in STATE["admins"]:
+
+        rows.append([
+            Button.inline(
+                f"❌ عزل {user_label(admin_id)}",
+                data=f"adm_rm:{admin_id}".encode()
+            )
+        ])
+
+    rows.append([Button.inline("➕ افزودن ادمین", data=b"adm_add")])
+    rows.append(back_button())
+
+    return "\n".join(lines), rows
+
+
+def codes_panel():
+
+    codes = list(STATE["codes"].items())[-15:]
+
+    lines = [
+        "📜 آخرین کدها",
+        "━━━━━━━━━━━━━━━━━━"
+    ]
+
+    if not codes:
+        lines.append("هنوز کدی ساخته نشده است.")
+
+    for code, info in reversed(codes):
+
+        if info.get("used_by"):
+            state = f"✅ مصرف شد ({user_label(info['used_by'])})"
+        else:
+            state = "🟡 مصرف‌نشده"
+
+        lines.append(f"{code} • {info['days']} روز • {state}")
+
+    return "\n".join(lines), [back_button()]
+
+
+# ---------------------------------------------------------
+# LOGIN FLOW (شماره -> کد ورود -> رمز دومرحله‌ای؛ هیچ‌کدام ذخیره نمی‌شوند)
+# ---------------------------------------------------------
+
+DISCLOSURE = (
+    "🔐 قبل از اتصال بخوان:\n\n"
+    "• سلف با اجازه‌ی تو روی اکانتت اجرا می‌شود و فقط در گروه‌هایی که خودت دستور بدهی فعال است.\n"
+    "• شماره، کد ورود و رمز دومرحله‌ای فقط برای ورود استفاده می‌شوند و ذخیره نمی‌شوند.\n"
+    "• نشست (Session) اکانت رمزنگاری‌شده نگهداری می‌شود.\n"
+    "• هر زمان با «حذف اکانت من» نشست بسته و داده‌ها پاک می‌شود. "
+    "از تلگرام ← Devices هم می‌توانی آن را ببندی.\n\n"
+    "با زدن «موافقم» ادامه می‌دهی."
+)
+
+
+async def start_purpose(event, user_id, purpose):
+
+    days, error = validate_purpose(user_id, purpose)
+
+    if error:
+
+        await event.respond(error, buttons=[back_button()])
+        return
+
+    is_owner_account = purpose["kind"] == "owner"
+
+    # اکانتی که قبلاً وصل شده: بدون شماره و کد، فقط فعال/تمدید می‌شود
+    if not is_owner_account:
+
+        existing = find_user_account(user_id)
+
+        if existing is not None:
+
+            if accounts[existing].authorized:
+
+                commit_purpose(user_id, purpose)
+                apply_grant(existing, days)
+
+                text, rows = user_status_panel(user_id)
+
+                await event.respond(
+                    f"✅ سلف روی اکانت قبلی‌ات فعال شد ({days} روز).\n\n{text}",
+                    buttons=rows
+                )
+
+                return
+
+            # Session باطل‌شده؛ باید دوباره وارد شود
+            await remove_account(existing)
+
+    if len(accounts_meta) >= MAX_ACCOUNTS:
+
+        await event.respond(
+            f"⚠️ ظرفیت اکانت‌ها ({MAX_ACCOUNTS}) تکمیل است. بعداً دوباره امتحان کن.",
+            buttons=[back_button()]
+        )
+
+        return
+
+    await clear_flow(user_id)
+
+    if is_owner_account:
+
+        flows[user_id] = {"step": "phone", "purpose": purpose}
+
+        await event.respond(
+            "📱 شماره اکانت را با کد کشور بفرست.\n"
+            "مثال: +989121234567\n\nبرای لغو: /cancel"
+        )
+
+        return
+
+    flows[user_id] = {"step": "consent", "purpose": purpose}
 
     await event.respond(
-        "📱 شماره اکانت را با کد کشور بفرست.\n"
-        "مثال: +989121234567\n\n"
-        "برای لغو: /cancel"
+        DISCLOSURE,
+        buttons=[
+            [Button.inline("✅ موافقم، ادامه", data=b"consent")],
+            [Button.inline("❌ انصراف", data=b"menu")]
+        ]
     )
 
 
-async def finish_add(event):
+async def finish_login(event, user_id):
 
+    flow = flows[user_id]
     temporary = flow["client"]
-    account_id = flow["account_id"]
+    purpose = flow["purpose"]
 
     await safe_delete(event)  # پاک کردن پیام حاوی کد/رمز
 
+    async def abort(message):
+
+        try:
+            await temporary.log_out()
+        except Exception:
+            pass
+
+        flow["client"] = None
+        flows.pop(user_id, None)
+
+        await event.respond(message, buttons=[back_button()])
+
     me = await temporary.get_me()
 
-    for meta in accounts_meta.values():
+    if any(
+        meta.get("user_id") and meta.get("user_id") == me.id
+        for meta in accounts_meta.values()
+    ):
 
-        if meta.get("user_id") and meta.get("user_id") == me.id:
+        await abort("⚠️ این اکانت قبلاً در ربات ثبت شده است.")
+        return
 
-            try:
-                await temporary.log_out()
-            except Exception:
-                pass
+    if len(accounts_meta) >= MAX_ACCOUNTS:
 
-            shutil.rmtree(ACCOUNTS_DIR / account_id, ignore_errors=True)
+        await abort(f"⚠️ ظرفیت اکانت‌ها ({MAX_ACCOUNTS}) تکمیل شد.")
+        return
 
-            flow.clear()
-            flow["step"] = None
+    # برای کاربر عادی، مصرف‌شدنِ تست/کد/خرید دوباره بررسی می‌شود
+    days, error = validate_purpose(user_id, purpose)
 
-            await event.respond("⚠️ این اکانت قبلاً اضافه شده است.")
+    if error:
 
-            return
+        await abort(error)
+        return
+
+    is_owner_account = purpose["kind"] == "owner"
+    account_id = new_account_id()
 
     accounts_meta[account_id] = {
         "name": me.first_name or me.username or account_id,
         "user_id": me.id,
+        "kind": "owner" if is_owner_account else "user",
+        "bot_user": user_id,
         "enabled": True,
         "expires_at": None,
         "created": int(time.time())
     }
 
-    save_accounts_meta()
+    save_session_string(account_id, temporary.session.save())
 
     await start_account(account_id, temporary)
 
-    flow.clear()
-    flow.update(step="days", account_id=account_id, mode="set")
+    flow["client"] = None  # دیگر نباید قطع شود؛ حالا مالکش Account است
+    flows.pop(user_id, None)
+
+    if is_owner_account:
+
+        save_accounts_meta()
+
+        text, rows = account_panel(account_id, "owner")
+
+        await event.respond(
+            f"✅ اکانت وصل شد. مدت: نامحدود (از پنل می‌توانی مدت بگذاری).\n\n{text}",
+            buttons=rows
+        )
+
+        return
+
+    commit_purpose(user_id, purpose)
+    apply_grant(account_id, days)
+
+    text, rows = user_status_panel(user_id)
 
     await event.respond(
-        f"✅ اکانت «{accounts_meta[account_id]['name']}» وصل شد.\n\n"
-        "⏳ چند روز سلف این اکانت فعال باشد؟\n"
-        "یک عدد بفرست (۰ = نامحدود)."
+        f"✅ سلف روی اکانتت وصل و فعال شد ({days} روز).\n\n{text}",
+        buttons=rows
+    )
+
+    await notify(
+        OWNER_ID,
+        f"👤 {user_label(user_id)} سلف را وصل کرد.\n"
+        f"نوع: {purpose['kind']} • مدت: {days} روز"
     )
 
 
-@bot.on(events.CallbackQuery)
-async def panel_callback(event):
+# ---------------------------------------------------------
+# BUY
+# ---------------------------------------------------------
 
-    if event.sender_id != OWNER_ID:
-        await event.answer("⛔ دسترسی نداری.", alert=True)
+async def handle_buy(event, user_id):
+
+    user = get_user(user_id)
+
+    # خرید تأییدشده: سلف روی اکانت وصل (یا فعال) می‌شود
+    if int(user.get("entitled_days", 0)) > 0:
+
+        await start_purpose(event, user_id, {"kind": "buy"})
         return
 
-    data = (event.data or b"").decode()
-    action, _, account_id = data.partition(":")
+    has_pending = any(
+        info["uid"] == user_id
+        for info in pending_requests().values()
+    )
 
-    if action == "list":
+    if not has_pending:
 
-        await reset_flow()
+        request_id = new_request_id()
 
-        text, buttons = main_panel()
-        await show(event, text, buttons)
-        await event.answer()
-        return
+        STATE["requests"][request_id] = {
+            "uid": user_id,
+            "time": int(time.time()),
+            "status": "pending",
+            "days": 0
+        }
 
-    if action == "add":
+        save_bot_state()
 
-        await event.answer()
-        await begin_add(event)
-        return
+        await notify(
+            OWNER_ID,
+            f"🛒 درخواست خرید جدید #{request_id}\n"
+            f"کاربر: {user_label(user_id)}\n"
+            f"آیدی عددی: {user_id}",
+            buttons=[[
+                Button.inline("✅ تایید و تعیین مدت", data=f"rq_ok:{request_id}".encode()),
+                Button.inline("❌ رد", data=f"rq_no:{request_id}".encode())
+            ]]
+        )
 
-    if account_id not in accounts_meta:
+    contact = OWNER_USERNAME or "(آیدی مالک تنظیم نشده)"
 
-        await event.answer("این اکانت دیگر وجود ندارد.", alert=True)
+    await event.respond(
+        "🛒 برای خرید سلف به آیدی من پیام بده:\n"
+        f"{contact}\n\n"
+        "بعد از تایید خرید، دوباره همین دکمه (خرید سلف) را بزن تا سلف روی اکانتت وصل شود.",
+        buttons=[back_button()]
+    )
 
-        text, buttons = main_panel()
-        await show(event, text, buttons)
-        return
+
+# ---------------------------------------------------------
+# CALLBACKS
+# ---------------------------------------------------------
+
+async def dispatch_callback(event, user_id, action, argument):
+
+    """اگر رشته‌ای برگرداند، به‌صورت هشدار به کاربر نشان داده می‌شود."""
+
+    role = role_of(user_id)
+    is_owner = role == "owner"
+    is_staff = role in ("owner", "admin")
+
+    # ---------- همه ----------
+
+    if action == "menu":
+
+        await clear_flow(user_id)
+
+        text, rows = menu_for(user_id)
+        await show(event, text, rows)
+        return None
+
+    # ---------- کاربر عادی ----------
+
+    if action == "trial":
+
+        await start_purpose(event, user_id, {"kind": "trial"})
+        return None
+
+    if action == "usecode":
+
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "enter_code"}
+
+        await event.respond(
+            "🔑 کد ویژه را بفرست.\nبرای لغو: /cancel"
+        )
+        return None
+
+    if action == "buy":
+
+        await handle_buy(event, user_id)
+        return None
+
+    if action == "status":
+
+        text, rows = user_status_panel(user_id)
+        await show(event, text, rows)
+        return None
+
+    if action == "consent":
+
+        flow = flows.get(user_id)
+
+        if not flow or flow.get("step") != "consent":
+            return "این مرحله منقضی شده؛ دوباره از /start شروع کن."
+
+        flow["step"] = "phone"
+
+        await event.respond(
+            "📱 شماره اکانت را با کد کشور بفرست.\n"
+            "مثال: +989121234567\n\nبرای لغو: /cancel"
+        )
+        return None
+
+    if action == "udel":
+
+        await show(
+            event,
+            "🗑 اکانتت حذف شود؟\n"
+            "سلف خاموش می‌شود، نشست از تلگرام خارج می‌شود و داده‌هایت پاک می‌شود.",
+            [
+                [Button.inline("✅ بله، حذف کن", data=b"udelok")],
+                [Button.inline("⬅️ نه", data=b"status")]
+            ]
+        )
+        return None
+
+    if action == "udelok":
+
+        account_id = find_user_account(user_id)
+
+        if account_id is not None:
+            await remove_account(account_id)
+
+        text, rows = user_menu(user_id)
+        await show(event, "✅ اکانتت حذف شد.\n\n" + text, rows)
+        return None
+
+    # ---------- ادمین و مالک ----------
+
+    if not is_staff:
+        return "⛔ دسترسی نداری."
+
+    if action == "accs":
+
+        text, rows = accounts_panel()
+        await show(event, text, rows)
+        return None
 
     if action == "acc":
 
-        await reset_flow()
+        if argument not in accounts_meta:
+            return "این اکانت وجود ندارد."
 
-        text, buttons = account_panel(account_id)
-        await show(event, text, buttons)
-        await event.answer()
+        text, rows = account_panel(argument, role)
+        await show(event, text, rows)
+        return None
 
-    elif action == "tog":
+    if action == "tog":
 
-        meta = accounts_meta[account_id]
+        meta = accounts_meta.get(argument)
+
+        if meta is None:
+            return "این اکانت وجود ندارد."
 
         if meta.get("enabled"):
 
-            disable_account(account_id)
-            await event.answer("سلف خاموش شد.")
+            disable_account(argument)
 
         else:
 
@@ -2767,123 +3640,261 @@ async def panel_callback(event):
 
             if expires_at and time.time() >= expires_at:
 
-                await event.answer(
-                    "مدت این اکانت تمام شده؛ ابتدا مدت را تنظیم یا تمدید کن.",
-                    alert=True
+                return (
+                    "مدت این اکانت تمام شده؛ مالک باید مدت را تنظیم یا تمدید کند."
                 )
-                return
 
             meta["enabled"] = True
             save_accounts_meta()
 
-            await event.answer("سلف روشن شد.")
+        text, rows = account_panel(argument, role)
+        await show(event, text, rows)
+        return None
 
-        text, buttons = account_panel(account_id)
-        await show(event, text, buttons)
+    if action == "newcode":
 
-    elif action in ("days", "ext"):
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "newcode"}
 
-        await reset_flow()
-
-        flow.update(
-            step="days",
-            account_id=account_id,
-            mode="set" if action == "days" else "ext"
+        await event.respond(
+            "🎟 مدت کد را به روز بفرست.\n"
+            "برای ساخت چند کد با همان مدت، عدد دوم را بده: مثلاً «10 5» = ۵ کد ۱۰ روزه (حداکثر ۲۰).\n"
+            "هر کد یک‌بار مصرف است.\n\nبرای لغو: /cancel"
         )
+        return None
 
-        await event.answer()
+    # ---------- فقط مالک ----------
+
+    if not is_owner:
+        return "⛔ این بخش فقط برای مالک است."
+
+    if action == "addown":
+
+        await start_purpose(event, user_id, {"kind": "owner"})
+        return None
+
+    if action == "gtog":
+
+        STATE["global_off"] = not STATE.get("global_off", False)
+        save_bot_state()
+
+        if STATE["global_off"]:
+
+            for account in accounts.values():
+                account.stop_tasks()
+
+        text, rows = owner_menu()
+        await show(event, text, rows)
+        return None
+
+    if action in ("days", "ext"):
+
+        if argument not in accounts_meta:
+            return "این اکانت وجود ندارد."
+
+        await clear_flow(user_id)
+
+        flows[user_id] = {
+            "step": "days",
+            "account_id": argument,
+            "mode": "set" if action == "days" else "ext"
+        }
 
         if action == "days":
 
             await event.respond(
                 "⏳ از همین الان چند روز فعال باشد؟\n"
-                "یک عدد بفرست (۰ = نامحدود).\n"
-                "برای لغو: /cancel"
+                "یک عدد بفرست (۰ = نامحدود).\nبرای لغو: /cancel"
             )
 
         else:
 
             await event.respond(
                 "➕ چند روز به مدت فعلی اضافه شود؟\n"
-                "یک عدد بزرگ‌تر از صفر بفرست.\n"
-                "برای لغو: /cancel"
+                "یک عدد بزرگ‌تر از صفر بفرست.\nبرای لغو: /cancel"
             )
 
-    elif action == "del":
+        return None
 
-        name = accounts_meta[account_id].get("name", account_id)
+    if action == "del":
+
+        meta = accounts_meta.get(argument)
+
+        if meta is None:
+            return "این اکانت وجود ندارد."
 
         await show(
             event,
-            f"🗑 اکانت «{name}» حذف شود؟\n"
-            "سلف خاموش و Session این اکانت از تلگرام خارج می‌شود "
-            "و همه‌ی تنظیماتش پاک می‌شود.",
+            f"🗑 اکانت «{meta.get('name', argument)}» حذف شود؟\n"
+            "سلف خاموش، Session از تلگرام خارج و همه‌ی داده‌هایش پاک می‌شود.",
             [
-                [Button.inline("✅ بله، حذف کن", data=f"delok:{account_id}".encode())],
-                [Button.inline("⬅️ نه", data=f"acc:{account_id}".encode())]
+                [Button.inline("✅ بله، حذف کن", data=f"delok:{argument}".encode())],
+                [Button.inline("⬅️ نه", data=f"acc:{argument}".encode())]
             ]
         )
+        return None
 
-        await event.answer()
+    if action == "delok":
 
-    elif action == "delok":
+        if argument in accounts_meta:
+            await remove_account(argument)
 
-        account = accounts.pop(account_id, None)
+        text, rows = accounts_panel()
+        await show(event, text, rows)
+        return None
 
-        if account is not None:
+    if action == "rqlist":
 
-            account.stop_tasks()
+        text, rows = requests_panel()
+        await show(event, text, rows)
+        return None
 
-            try:
-                if await account.client.is_user_authorized():
-                    await account.client.log_out()
-            except Exception as error:
-                print("[DELETE LOGOUT ERROR]", repr(error))
+    if action == "rq":
 
-            try:
-                await account.client.disconnect()
-            except Exception:
-                pass
+        text, rows = request_panel(argument)
+        await show(event, text, rows)
+        return None
 
-        accounts_meta.pop(account_id, None)
-        save_accounts_meta()
+    if action == "rq_ok":
 
-        shutil.rmtree(ACCOUNTS_DIR / account_id, ignore_errors=True)
+        info = STATE["requests"].get(argument)
 
-        await event.answer("اکانت حذف شد.")
+        if info is None or info["status"] != "pending":
+            return "این درخواست دیگر در انتظار نیست."
 
-        text, buttons = main_panel()
-        await show(event, text, buttons)
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "approve_days", "request_id": argument}
 
+        await event.respond(
+            f"✅ درخواست #{argument} ({user_label(info['uid'])})\n"
+            "سلف چند روز روشن بماند؟ یک عدد بفرست.\nبرای لغو: /cancel"
+        )
+        return None
+
+    if action == "rq_no":
+
+        info = STATE["requests"].get(argument)
+
+        if info is None or info["status"] != "pending":
+            return "این درخواست دیگر در انتظار نیست."
+
+        info["status"] = "rejected"
+        save_bot_state()
+
+        await notify(info["uid"], "❌ درخواست خرید تو تایید نشد. برای پیگیری به مالک پیام بده.")
+
+        text, rows = requests_panel()
+        await show(event, text, rows)
+        return None
+
+    if action == "admins":
+
+        text, rows = admins_panel()
+        await show(event, text, rows)
+        return None
+
+    if action == "adm_add":
+
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "admin_add"}
+
+        await event.respond(
+            "👮 آیدی عددی ادمین جدید را بفرست.\n"
+            "(شخص باید حداقل یک‌بار ربات را /start کرده باشد.)\nبرای لغو: /cancel"
+        )
+        return None
+
+    if action == "adm_rm":
+
+        admin_id = int(argument) if argument.isdigit() else None
+
+        if admin_id in STATE["admins"]:
+
+            STATE["admins"].remove(admin_id)
+            save_bot_state()
+
+            await notify(admin_id, "ℹ️ دسترسی ادمین تو توسط مالک برداشته شد.")
+
+        text, rows = admins_panel()
+        await show(event, text, rows)
+        return None
+
+    if action == "codes":
+
+        text, rows = codes_panel()
+        await show(event, text, rows)
+        return None
+
+    return None
+
+
+@bot.on(events.CallbackQuery)
+async def panel_callback(event):
+
+    user_id = event.sender_id
+
+    data = (event.data or b"").decode()
+    action, _, argument = data.partition(":")
+
+    try:
+
+        await touch_user(event)
+        alert = await dispatch_callback(event, user_id, action, argument)
+
+    except Exception as error:
+
+        print("[CALLBACK ERROR]", repr(error))
+        alert = "خطایی رخ داد. دوباره امتحان کن."
+
+    try:
+
+        await event.answer(alert or None, alert=bool(alert))
+
+    except Exception:
+
+        pass
+
+
+# ---------------------------------------------------------
+# MESSAGES
+# ---------------------------------------------------------
 
 @bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
 async def bot_message_handler(event):
 
-    if event.sender_id != OWNER_ID:
-        return
-
+    user_id = event.sender_id
     text = (event.raw_text or "").strip()
+
+    await touch_user(event)
+
+    role = role_of(user_id)
+    flow = flows.get(user_id) or {}
     step = flow.get("step")
 
     # ---------- commands ----------
 
     if text.lower() in ("/start", "/panel", "/menu"):
 
-        await reset_flow()
+        await clear_flow(user_id)
 
-        panel_text, buttons = main_panel()
-        await event.respond(panel_text, buttons=buttons)
-        return
-
-    if text.lower() in ("/login", "/add"):
-
-        await begin_add(event)
+        menu_text, rows = menu_for(user_id)
+        await event.respond(menu_text, buttons=rows)
         return
 
     if text.lower() == "/cancel":
 
-        await reset_flow()
-        await event.respond("لغو شد. برای پنل: /panel")
+        await clear_flow(user_id)
+        await event.respond("لغو شد. برای منو: /start")
+        return
+
+    # ---------- کد ویژه ----------
+
+    if step == "enter_code":
+
+        await clear_flow(user_id)
+        await safe_delete(event)
+
+        await start_purpose(event, user_id, {"kind": "code", "code": text})
         return
 
     # ---------- phone ----------
@@ -2891,16 +3902,8 @@ async def bot_message_handler(event):
     if step == "phone":
 
         phone = "+" + only_digits(text)
-        account_id = flow["account_id"]
 
-        folder = ACCOUNTS_DIR / account_id
-        folder.mkdir(parents=True, exist_ok=True)
-
-        temporary = TelegramClient(
-            str(folder / "session"),
-            API_ID,
-            API_HASH
-        )
+        temporary = TelegramClient(StringSession(), API_ID, API_HASH)
 
         try:
 
@@ -2934,10 +3937,13 @@ async def bot_message_handler(event):
             client=temporary
         )
 
+        await safe_delete(event)
+
         await event.respond(
             "📨 کد به تلگرام اکانت ارسال شد.\n\n"
             "⚠️ کد را با خط تیره یا فاصله بفرست، مثلاً: 1-2-3-4-5\n"
-            "(اگر کد را پشت‌سرهم بفرستی تلگرام آن را باطل می‌کند)"
+            "(اگر کد را پشت‌سرهم بفرستی تلگرام آن را باطل می‌کند)\n\n"
+            "برای لغو: /cancel"
         )
         return
 
@@ -2971,8 +3977,8 @@ async def bot_message_handler(event):
 
         except PhoneCodeExpiredError:
 
-            await reset_flow()
-            await event.respond("⌛ کد منقضی شد. دوباره /login بزن.")
+            await clear_flow(user_id)
+            await event.respond("⌛ کد منقضی شد. دوباره از /start شروع کن.")
             return
 
         except Exception as error:
@@ -2980,7 +3986,7 @@ async def bot_message_handler(event):
             await event.respond(f"❌ خطا: {error}")
             return
 
-        await finish_add(event)
+        await finish_login(event, user_id)
         return
 
     # ---------- 2FA password ----------
@@ -3003,20 +4009,63 @@ async def bot_message_handler(event):
             await event.respond(f"❌ خطا: {error}")
             return
 
-        await finish_add(event)
+        await finish_login(event, user_id)
         return
 
-    # ---------- days ----------
+    # ---------- ساخت کد ویژه (ادمین و مالک) ----------
 
-    if step == "days":
+    if step == "newcode" and role in ("owner", "admin"):
+
+        numbers = re.findall(r"\d+", normalize_digits(text))
+
+        if not numbers or int(numbers[0]) <= 0:
+
+            await event.respond("❌ یک عدد بزرگ‌تر از صفر بفرست.")
+            return
+
+        days = int(numbers[0])
+        count = min(max(int(numbers[1]), 1), 20) if len(numbers) > 1 else 1
+
+        created = []
+
+        for _ in range(count):
+
+            code = make_code()
+
+            while code in STATE["codes"]:
+                code = make_code()
+
+            STATE["codes"][code] = {
+                "days": days,
+                "created_by": user_id,
+                "created": int(time.time()),
+                "used_by": None
+            }
+
+            created.append(code)
+
+        save_bot_state()
+        await clear_flow(user_id)
+
+        await event.respond(
+            f"🎟 {len(created)} کد یک‌بار مصرف ({days} روزه) ساخته شد:\n\n"
+            + "\n".join(f"`{code}`" for code in created)
+            + "\n\nکاربر باید در ربات «استفاده از کد ویژه» را بزند.",
+            buttons=[back_button()]
+        )
+        return
+
+    # ---------- فقط مالک ----------
+
+    if role == "owner" and step == "days":
 
         account_id = flow.get("account_id")
         mode = flow.get("mode", "set")
 
         if account_id not in accounts_meta:
 
-            await reset_flow()
-            await event.respond("این اکانت دیگر وجود ندارد. /panel")
+            await clear_flow(user_id)
+            await event.respond("این اکانت دیگر وجود ندارد.")
             return
 
         try:
@@ -3052,13 +4101,90 @@ async def bot_message_handler(event):
         meta["enabled"] = True
         save_accounts_meta()
 
-        await reset_flow()
+        await clear_flow(user_id)
 
-        panel_text, buttons = account_panel(account_id)
-        await event.respond(panel_text, buttons=buttons)
+        panel_text, rows = account_panel(account_id, "owner")
+        await event.respond(panel_text, buttons=rows)
         return
 
-    await event.respond("برای باز کردن پنل: /panel")
+    if role == "owner" and step == "approve_days":
+
+        request_id = flow.get("request_id")
+        info = STATE["requests"].get(request_id)
+
+        if info is None or info["status"] != "pending":
+
+            await clear_flow(user_id)
+            await event.respond("این درخواست دیگر در انتظار نیست.")
+            return
+
+        try:
+
+            value = clean_number(text)
+
+        except ValueError:
+
+            await event.respond("❌ فقط یک عدد بفرست.")
+            return
+
+        if value <= 0:
+
+            await event.respond("❌ عدد باید بزرگ‌تر از صفر باشد.")
+            return
+
+        buyer = get_user(info["uid"])
+
+        buyer["entitled_days"] = int(buyer.get("entitled_days", 0)) + value
+        info["status"] = "approved"
+        info["days"] = value
+
+        save_bot_state()
+        await clear_flow(user_id)
+
+        await notify(
+            info["uid"],
+            f"✅ خرید تو تایید شد ({value} روز).\n"
+            "از /start دکمه «خرید سلف» را بزن تا سلف روی اکانتت وصل شود.",
+            buttons=[[Button.inline("🛒 خرید سلف", data=b"buy")]]
+        )
+
+        await event.respond(
+            f"✅ درخواست #{request_id} تایید شد: {value} روز برای {user_label(info['uid'])}.",
+            buttons=[back_button(b"rqlist")]
+        )
+        return
+
+    if role == "owner" and step == "admin_add":
+
+        digits = only_digits(text)
+
+        if not digits:
+
+            await event.respond("❌ آیدی عددی معتبر بفرست.")
+            return
+
+        admin_id = int(digits)
+
+        if admin_id == OWNER_ID:
+
+            await event.respond("این آیدی خودِ مالک است.")
+            return
+
+        if admin_id not in STATE["admins"]:
+
+            STATE["admins"].append(admin_id)
+            save_bot_state()
+
+        await clear_flow(user_id)
+
+        await notify(admin_id, "🛡 تو توسط مالک ادمین شدی. برای پنل: /start")
+
+        panel_text, rows = admins_panel()
+        await event.respond(panel_text, buttons=rows)
+        return
+
+    menu_text, rows = menu_for(user_id)
+    await event.respond(menu_text, buttons=rows)
 
 
 # =========================================================
@@ -3073,6 +4199,7 @@ async def main():
 
     await bot.start(bot_token=BOT_TOKEN)
 
+    load_bot_state()
     load_accounts_meta()
     migrate_legacy()
 
@@ -3101,20 +4228,14 @@ async def main():
     watcher = asyncio.create_task(expiry_watcher())
 
     message = (
-        f"✅ سرویس بالا آمد. تعداد اکانت‌ها: {len(accounts_meta)}\n"
-        "برای مدیریت: /panel"
+        f"✅ سرویس بالا آمد. تعداد اکانت‌ها: {len(accounts_meta)}/{MAX_ACCOUNTS}\n"
+        "پنل مالک: /start"
     )
 
     if broken:
         message += "\n\n⚠️ نیاز به ورود مجدد: " + "، ".join(broken)
 
-    try:
-
-        await bot.send_message(OWNER_ID, message)
-
-    except Exception as error:
-
-        print("[BOT NOTIFY ERROR]", repr(error))
+    await notify(OWNER_ID, message)
 
     print("=" * 50)
     print("Waiting for commands...")
