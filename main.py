@@ -26,29 +26,24 @@ from telethon.errors import (
 
 
 # =========================================================
-# 1. TELEGRAM ACCOUNT  (از Environment Variable خوانده می‌شود)
+# 1. TELEGRAM ACCOUNT  (تنظیمات مستقیم داخل کد)
 # =========================================================
 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ["OWNER_ID"])  # آیدی عددی خودت
-OWNER_USERNAME = @Arshia25a
-MAX_ACCOUNTS = int(os.environ.get("MAX_ACCOUNTS", "20"))
+# اطلاعات ربات و اکانت مالک را اینجا وارد کن
+API_ID = 36006348                         # عدد API ID
+API_HASH = "caa664949252baecd0b18ce3bf589b91"              # API HASH
+BOT_TOKEN = "8758291446:AAFVi179EV95tJn5PWdkT6FgqJpQISjizAQ"            # توکن ربات
+OWNER_ID = 6646045908                    # آیدی عددی مالک
+OWNER_USERNAME = "@Arshia25a"           # یوزرنیم مالک
+MAX_ACCOUNTS = 20                       # حداکثر تعداد اکانت‌ها
 
-# کلید رمزنگاری Sessionها. ساخت: python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"
-try:
-    FERNET = Fernet(os.environ["SESSION_KEY"].encode())
-except Exception:
-    raise SystemExit("SESSION_KEY تنظیم نشده یا نامعتبر است.")
+# کلید رمزنگاری Sessionها؛ در اجراهای بعدی همین مقدار را حفظ کن
+SESSION_KEY = "y0TxpkUsuBfTd9UsKoTULDzbG5Y3HL-FHLnJIknODj4="
+FERNET = Fernet(SESSION_KEY.encode())
 
-if OWNER_USERNAME and not OWNER_USERNAME.startswith("@"):
-    OWNER_USERNAME = "@" + OWNER_USERNAME
-
-# مسیر Volume در Railway
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+# مسیر ذخیره اطلاعات و Sessionها
+DATA_DIR = Path("/home/arshia2037/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 
 
 # =========================================================
