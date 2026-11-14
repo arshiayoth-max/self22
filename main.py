@@ -33,7 +33,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])  # آیدی عددی خودت
-OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "").strip()  # مثلاً @myid
+OWNER_USERNAME = @Arshia25a
 MAX_ACCOUNTS = int(os.environ.get("MAX_ACCOUNTS", "20"))
 
 # کلید رمزنگاری Sessionها. ساخت: python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"
