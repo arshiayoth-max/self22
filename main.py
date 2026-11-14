@@ -71,10 +71,16 @@ OWNER_USERNAME = "@your_username"
 MAX_ACCOUNTS = int(os.environ.get("MAX_ACCOUNTS", "20"))
 
 # کلید رمزنگاری Sessionها. ساخت: python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"
+_session_key = need("SESSION_KEY").strip().strip('"').strip("'")
+
 try:
-    FERNET = Fernet(need("SESSION_KEY").encode())
+    FERNET = Fernet(_session_key.encode())
 except Exception:
-    raise SystemExit("SESSION_KEY تنظیم نشده یا نامعتبر است.")
+    print(
+        f"[ENV ERROR] SESSION_KEY نامعتبر است: طول مقدار = {len(_session_key)} "
+        "(باید دقیقاً ۴۴ کاراکتر باشد و آخرش علامت = بیاید)."
+    )
+    raise SystemExit("SESSION_KEY نامعتبر است.")
 
 if OWNER_USERNAME and not OWNER_USERNAME.startswith("@"):
     OWNER_USERNAME = "@" + OWNER_USERNAME
