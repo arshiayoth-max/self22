@@ -1,2425 +1,684 @@
+
 import asyncio
-import json
-import base64
 import os
-import re
-import random
+import sqlite3
+import secrets
+import string
 import time
-import math
-from datetime import datetime
 from pathlib import Path
 
-from telethon import TelegramClient, events, connection
-from telethon.errors import (
-    SessionPasswordNeededError,
-    PhoneCodeInvalidError,
-    PhoneCodeExpiredError,
-    PasswordHashInvalidError,
-    PhoneNumberInvalidError,
-    FloodWaitError
-)
+from telethon import TelegramClient, events, Button
 
 
-# =========================================================
-# 1. TELEGRAM ACCOUNT  (از Environment Variable خوانده می‌شود)
-# =========================================================
+# =====================================================
+# CONFIG
+# =====================================================
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_TOKEN = os.environ["LICENSE_BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
-# مسیر Volume در Railway
+
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-SESSION_NAME = str(DATA_DIR / "mafia_auto_manager")
+DB_PATH = DATA_DIR / "license_service.db"
 
-
-# =========================================================
-# 2. CLIENTS
-# =========================================================
-
-# اکانت اصلی (ورود از طریق ربات)
-client = TelegramClient(
-    SESSION_NAME,
-    API_ID,
-    API_HASH
-)
-
-# ربات لاگین
 bot = TelegramClient(
-    str(DATA_DIR / "login_bot"),
+    str(DATA_DIR / "license_bot"),
     API_ID,
     API_HASH
 )
 
+user_states = {}
 
-# =========================================================
-# 3. CONFIGURATION
-# =========================================================
 
-CONFIG_FILE = DATA_DIR / "mafia_settings.json"
+# =====================================================
+# DATABASE
+# =====================================================
 
-DEFAULT_SETTINGS = {
-    "product": "نام محصول",
-    "min_price": 300000,
-    "warehouse_capacity": 350,
-    "interval": 1800
-}
+db = sqlite3.connect(DB_PATH)
+db.row_factory = sqlite3.Row
 
-settings = {}
-tasks = {}
-locks = {}
-interval_events = {}
+db.executescript("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    trial_used INTEGER DEFAULT 0,
+    expires_at INTEGER DEFAULT 0,
+    enabled INTEGER DEFAULT 1,
+    created_at INTEGER
+);
 
+CREATE TABLE IF NOT EXISTS admins (
+    user_id INTEGER PRIMARY KEY,
+    added_at INTEGER
+);
 
-def load_settings():
+CREATE TABLE IF NOT EXISTS codes (
+    code TEXT PRIMARY KEY,
+    days INTEGER NOT NULL,
+    created_by INTEGER,
+    used_by INTEGER DEFAULT NULL,
+    used_at INTEGER DEFAULT NULL,
+    created_at INTEGER
+);
 
-    global settings
+CREATE TABLE IF NOT EXISTS purchases (
+    user_id INTEGER PRIMARY KEY,
+    status TEXT DEFAULT 'pending',
+    requested_at INTEGER,
+    approved_days INTEGER DEFAULT 0
+);
 
-    if not CONFIG_FILE.exists():
-        settings = {}
-        return
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+""")
 
-    try:
+db.commit()
 
-        loaded = json.loads(
-            CONFIG_FILE.read_text(encoding="utf-8")
-        )
 
-        settings = loaded if isinstance(loaded, dict) else {}
+# =====================================================
+# DATABASE HELPERS
+# =====================================================
 
-    except Exception as error:
+def now():
+    return int(time.time())
 
-        print("Config loading error:", repr(error))
-        settings = {}
 
+def ensure_user(user_id):
+    db.execute("""
+        INSERT OR IGNORE INTO users
+        (user_id, created_at)
+        VALUES (?, ?)
+    """, (user_id, now()))
+    db.commit()
 
-def save_settings():
 
-    CONFIG_FILE.write_text(
-        json.dumps(
-            settings,
-            ensure_ascii=False,
-            indent=4
-        ),
-        encoding="utf-8"
-    )
+def get_user(user_id):
+    ensure_user(user_id)
+    return db.execute(
+        "SELECT * FROM users WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
 
 
-def get_settings(chat_id):
+def is_owner(user_id):
+    return user_id == OWNER_ID
 
-    key = str(chat_id)
 
-    if key not in settings:
-
-        settings[key] = DEFAULT_SETTINGS.copy()
-        save_settings()
-
-    else:
-
-        for name, value in DEFAULT_SETTINGS.items():
-            settings[key].setdefault(name, value)
-
-    return settings[key]
-
-
-def get_lock(chat_id):
-
-    if chat_id not in locks:
-        locks[chat_id] = asyncio.Lock()
-
-    return locks[chat_id]
-
-
-def get_interval_event(chat_id):
-
-    if chat_id not in interval_events:
-        interval_events[chat_id] = asyncio.Event()
-
-    return interval_events[chat_id]
-
-
-# =========================================================
-# 4. TEXT UTILITIES
-# =========================================================
-
-def normalize_digits(text):
-
-    table = str.maketrans(
-        "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
-        "01234567890123456789"
-    )
-
-    return str(text).translate(table)
-
-
-def clean_number(value):
-
-    value = normalize_digits(str(value))
-
-    digits = re.sub(r"\D", "", value)
-
-    if not digits:
-        raise ValueError("عدد معتبر نیست.")
-
-    return int(digits)
-
-
-def get_warehouse(text):
-
-    text = normalize_digits(text or "")
-
-    match = re.search(
-        r"انبار\s*:\s*([\d,٬]+)\s*/\s*([\d,٬]+)",
-        text
-    )
-
-    if not match:
-        return None
-
-    return (
-        clean_number(match.group(1)),
-        clean_number(match.group(2))
-    )
-
-
-def get_price(text):
-
-    text = normalize_digits(text or "")
-
-    match = re.search(
-        r"قیمت\s*الان\s*[:：]\s*`?([\d,٬،]+)",
-        text
-    )
-
-    if not match:
-        return None
-
-    return clean_number(match.group(1))
-
-
-def normalize_market_line(text):
-
-    text = normalize_digits(text or "")
-
-    for character in (
-        "\u200e",
-        "\u200f",
-        "\u200b",
-        "\ufeff",
-        "\u2060"
-    ):
-        text = text.replace(character, "")
-
-    return text.replace("*", "").replace("`", "").strip()
-
-
-def get_market_product_price(text, product):
-
-    wanted_product = normalize_market_line(
-        product
-    ).casefold()
-
-    if not wanted_product:
-        return None
-
-    lines = [
-        normalize_market_line(line)
-        for line in (text or "").splitlines()
-    ]
-
-    for index, line in enumerate(lines):
-
-        if wanted_product not in line.casefold():
-            continue
-
-        for following_line in lines[index + 1:]:
-
-            if not following_line:
-                continue
-
-            return get_price(following_line)
-
-        return None
-
-    return None
-
-
-# =========================================================
-# 4.1. ADAPTIVE ONLINE PRICE LEARNING
-# =========================================================
-
-PRICE_HISTORY_FILE = DATA_DIR / "mafia_price_history.json"
-PRICE_STATE_FILE = DATA_DIR / "mafia_price_learning_state.json"
-PRICE_HISTORY_LIMIT = 1000
-PRICE_INTERVAL_SECONDS = 3600
-PRICE_MIN_SAMPLE_GAP = 3300
-PRICE_RETURN_LIMIT = 0.08
-
-price_history = {}
-price_learning_state = {}
-
-
-def load_price_history():
-
-    global price_history, price_learning_state
-
-    try:
-        if PRICE_HISTORY_FILE.exists():
-            loaded = json.loads(PRICE_HISTORY_FILE.read_text(encoding="utf-8"))
-            price_history = loaded if isinstance(loaded, dict) else {}
-        else:
-            price_history = {}
-    except Exception as error:
-        print("[PRICE HISTORY LOAD ERROR]", repr(error))
-        price_history = {}
-
-    try:
-        if PRICE_STATE_FILE.exists():
-            loaded = json.loads(PRICE_STATE_FILE.read_text(encoding="utf-8"))
-            price_learning_state = loaded if isinstance(loaded, dict) else {}
-        else:
-            price_learning_state = {}
-    except Exception as error:
-        print("[PRICE STATE LOAD ERROR]", repr(error))
-        price_learning_state = {}
-
-
-def save_price_history():
-
-    temporary = PRICE_HISTORY_FILE.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(price_history, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-    temporary.replace(PRICE_HISTORY_FILE)
-
-
-def save_price_learning_state():
-
-    temporary = PRICE_STATE_FILE.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(price_learning_state, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-    temporary.replace(PRICE_STATE_FILE)
-
-
-def get_price_history_key(chat_id, product):
-
-    return f"{chat_id}:{str(product).strip().casefold()}"
-
-
-def _valid_price_records(records):
-
-    result = []
-    for item in records:
-        try:
-            timestamp = int(item["timestamp"])
-            price = int(item["price"])
-            if timestamp > 0 and price > 0:
-                result.append({"timestamp": timestamp, "price": price})
-        except (KeyError, TypeError, ValueError):
-            continue
-    result.sort(key=lambda item: item["timestamp"])
-    return result
-
-
-def _median(values):
-
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    middle = len(ordered) // 2
-    if len(ordered) % 2:
-        return ordered[middle]
-    return (ordered[middle - 1] + ordered[middle]) / 2.0
-
-
-def _candidate_returns(prices):
-
-    """Return several deliberately conservative one-hour forecast candidates."""
-
-    if len(prices) < 2:
-        return {"ثبات قیمت": 0.0}
-
-    returns = [
-        math.log(prices[index] / prices[index - 1])
-        for index in range(1, len(prices))
-        if prices[index - 1] > 0 and prices[index] > 0
-    ]
-
-    if not returns:
-        return {"ثبات قیمت": 0.0}
-
-    recent3 = returns[-3:]
-    recent5 = returns[-5:]
-
-    # Exponentially weighted recent movement.
-    ewma = returns[0]
-    alpha = 0.45
-    for value in returns[1:]:
-        ewma = alpha * value + (1.0 - alpha) * ewma
-
-    # Robust short trend from the latest price levels.
-    trend = 0.0
-    if len(prices) >= 3:
-        log_prices = [math.log(value) for value in prices[-8:]]
-        x_mean = (len(log_prices) - 1) / 2.0
-        y_mean = sum(log_prices) / len(log_prices)
-        denominator = sum((i - x_mean) ** 2 for i in range(len(log_prices)))
-        if denominator:
-            trend = sum(
-                (i - x_mean) * (value - y_mean)
-                for i, value in enumerate(log_prices)
-            ) / denominator
-
-    return {
-        "ثبات قیمت": 0.0,
-        "میانه تغییرات اخیر": 0.60 * _median(recent5),
-        "میانگین کوتاه‌مدت": 0.45 * (sum(recent3) / len(recent3)),
-        "میانگین نمایی": 0.60 * ewma,
-        "روند خطی تعدیل‌شده": 0.50 * trend,
-    }
-
-
-def _adaptive_forecast_return(prices):
-
-    candidates = _candidate_returns(prices)
-    names = list(candidates)
-
-    # Walk-forward validation: each historical point is predicted only
-    # from observations that would have been available at that time.
-    errors = {name: [] for name in names}
-    if len(prices) >= 5:
-        for end in range(3, len(prices)):
-            historical = prices[:end]
-            actual_return = math.log(prices[end] / prices[end - 1])
-            historical_candidates = _candidate_returns(historical)
-            for name in names:
-                predicted = historical_candidates.get(name, 0.0)
-                errors[name].append(abs(predicted - actual_return))
-
-    if any(errors.values()):
-        # Lower historical error earns more weight; smoothing prevents
-        # a single lucky forecast from dominating the ensemble.
-        inverse = {
-            name: 1.0 / (0.005 + (sum(values) / len(values) if values else 0.03))
-            for name, values in errors.items()
-        }
-        total = sum(inverse.values()) or 1.0
-        weights = {name: value / total for name, value in inverse.items()}
-    else:
-        weights = {name: 1.0 / len(names) for name in names}
-
-    forecast = sum(candidates[name] * weights[name] for name in names)
-    forecast = max(-PRICE_RETURN_LIMIT, min(PRICE_RETURN_LIMIT, forecast))
-
-    all_errors = [value for values in errors.values() for value in values]
-    validation_error = (sum(all_errors) / len(all_errors)) if all_errors else None
-
-    return forecast, weights, validation_error
-
-
-def predict_product_price_one_hour(chat_id, product, interval_seconds=3600):
-
-    key = get_price_history_key(chat_id, product)
-    records = _valid_price_records(price_history.get(key, []))
-    prices = [item["price"] for item in records]
-
-    if not prices:
-        return {"ready": False, "samples": 0, "required": 1}
-
-    current_price = prices[-1]
-    predicted_return, weights, validation_error = _adaptive_forecast_return(prices)
-    predicted_price = max(1, round(current_price * math.exp(predicted_return)))
-    change_percent = ((predicted_price / current_price) - 1.0) * 100.0
-
-    if change_percent > 0.15:
-        trend = "صعودی"
-    elif change_percent < -0.15:
-        trend = "نزولی"
-    else:
-        trend = "تقریباً ثابت"
-
-    if len(prices) == 1:
-        confidence = "آغاز یادگیری؛ داده قبلی وجود ندارد"
-    elif validation_error is None:
-        confidence = "در حال یادگیری"
-    elif validation_error < 0.01:
-        confidence = "خطای تاریخی کم"
-    elif validation_error < 0.03:
-        confidence = "خطای تاریخی متوسط"
-    else:
-        confidence = "خطای تاریخی زیاد"
-
-    return {
-        "ready": True,
-        "current": current_price,
-        "predicted": predicted_price,
-        "change_percent": change_percent,
-        "trend": trend,
-        "confidence": confidence,
-        "samples": len(prices),
-        "forecast_steps": 1,
-        "weights": weights,
-        "validation_error": validation_error,
-    }
-
-
-def format_price_prediction(chat_id, product, interval_seconds=3600):
-
-    result = predict_product_price_one_hour(chat_id, product, interval_seconds)
-    if not result["ready"]:
-        return "🧠 مغز یادگیرنده قیمت\n━━━━━━━━━━━━━━━━━━\nهنوز اولین قیمت ثبت نشده است؛ با اولین بررسی واقعی، پیش‌بینی آغاز می‌شود."
-
-    change_sign = "+" if result["change_percent"] >= 0 else ""
-    return (
-        "🧠 پیش‌بینی تطبیقی قیمت\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"محصول: {product}\n"
-        f"قیمت مبنا: {result['current']:,}\n"
-        f"پیش‌بینی یک ساعت آینده: {result['predicted']:,}\n"
-        f"تغییر احتمالی: {change_sign}{result['change_percent']:.2f}%\n"
-        f"روند تخمینی: {result['trend']}\n"
-        f"وضعیت یادگیری: {result['confidence']}\n"
-        f"نمونه‌های ساعتی: {result['samples']}\n"
-        "مدل با خطاهای قبلی وزن پیش‌بینی‌کننده‌ها را تنظیم می‌کند.\n"
-        "⚠️ پیش‌بینی تخمینی است و تضمین قیمت واقعی نیست."
-    )
-
-
-def update_price_learning_and_report(chat_id, product, price):
-
-    """Score the due one-hour forecast, learn from the new hourly point,
-    create the next forecast, persist everything, and return a DM report."""
-
-    key = get_price_history_key(chat_id, product)
-    now = int(time.time())
-    records = _valid_price_records(price_history.get(key, []))
-    state = price_learning_state.setdefault(key, {"pending": None, "evaluations": []})
-    pending = state.get("pending")
-    accuracy_text = "هنوز پیش‌بینی قبلی به افق یک‌ساعته نرسیده است."
-
-    if pending and now >= int(pending.get("target_timestamp", now + 1)):
-        predicted = int(pending.get("predicted_price", price))
-        actual = int(price)
-        accuracy = max(0.0, 100.0 * (1.0 - abs(predicted - actual) / max(actual, 1)))
-        evaluation = {
-            "timestamp": now,
-            "predicted": predicted,
-            "actual": actual,
-            "accuracy": round(accuracy, 4),
-            "absolute_error": abs(predicted - actual),
-        }
-        state.setdefault("evaluations", []).append(evaluation)
-        state["evaluations"] = state["evaluations"][-500:]
-        state["pending"] = None
-        accuracy_text = (
-            "📊 ارزیابی پیش‌بینی یک ساعت قبل\n"
-            f"پیش‌بینی قبلی: {predicted:,}\n"
-            f"قیمت واقعی: {actual:,}\n"
-            f"درصد نزدیکی: {accuracy:.2f}%\n"
-            f"اختلاف قیمت: {abs(predicted - actual):,}"
-        )
-
-    # The game price is hourly. Ignore repeated polling within the same hour
-    # so 30-minute checks do not train the model on duplicate observations.
-    should_add = (
-        not records
-        or now - records[-1]["timestamp"] >= PRICE_MIN_SAMPLE_GAP
-    )
-
-    # Migrate gracefully from the previous script version: if old history
-    # exists but no pending forecast was saved, start forecasting immediately.
-    if not pending and records and not should_add:
-        result = predict_product_price_one_hour(chat_id, product, 3600)
-        predicted = result["predicted"] if result["ready"] else int(price)
-        state["pending"] = {
-            "issued_timestamp": now,
-            "target_timestamp": now + PRICE_INTERVAL_SECONDS,
-            "base_price": int(price),
-            "predicted_price": int(predicted),
-        }
-        save_price_learning_state()
-        pending = state["pending"]
-
-    if should_add:
-        records.append({"timestamp": now, "price": int(price)})
-        price_history[key] = records[-PRICE_HISTORY_LIMIT:]
-        save_price_history()
-
-        result = predict_product_price_one_hour(chat_id, product, 3600)
-        predicted = result["predicted"] if result["ready"] else int(price)
-        state["pending"] = {
-            "issued_timestamp": now,
-            "target_timestamp": now + PRICE_INTERVAL_SECONDS,
-            "base_price": int(price),
-            "predicted_price": int(predicted),
-        }
-        save_price_learning_state()
-
-        return (
-            f"{accuracy_text}\n\n"
-            "🧠 پیش‌بینی جدید برای یک ساعت آینده\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"محصول: {product}\n"
-            f"قیمت فعلی: {int(price):,}\n"
-            f"پیش‌بینی یک ساعت آینده: {int(predicted):,}\n"
-            f"تعداد نمونه‌های ساعتی: {len(price_history[key])}\n"
-            "مدل پس از دریافت قیمت واقعی بعدی، درصد نزدیکی را محاسبه و وزن‌هایش را به‌روزرسانی می‌کند."
-        )
-
-    # If the next one-hour observation has not arrived yet, keep the existing
-    # forecast intact rather than resetting its evaluation deadline.
-    save_price_learning_state()
-    return (
-        f"🧠 پایش قیمت محصول: {product}\n"
-        f"قیمت مشاهده‌شده فعلی: {int(price):,}\n"
-        f"پیش‌بینی فعال برای موعد یک‌ساعته: {int((pending or {}).get('predicted_price', price)):,}\n"
-        f"{accuracy_text}\n"
-        "هنوز یک ساعت کامل از آخرین نمونه نگذشته؛ پیش‌بینی فعال تغییر داده نشد."
-    )
-
-
-# =========================================================
-# 5. FACTORY MESSAGE DETECTION
-# =========================================================
-
-def is_factory_message(text):
-
-    if not text:
-        return False
-
-    text = normalize_digits(text)
-
-    patterns = [
-        r"مدیر\s*:",
-        r"انبار\s*:",
-        r"نیرو\s*:",
-        r"دستگاه\s*:",
-        r"سرکارگر\s*:"
-    ]
-
-    matched = sum(
-        bool(re.search(pattern, text))
-        for pattern in patterns
-    )
-
-    return (
-        bool(re.search(r"انبار\s*:", text))
-        and matched >= 3
-    )
-
-
-async def send_factory_and_wait(chat_id, timeout=60):
-
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-
-    command_message = None
-
-    async def check_factory(event):
-
-        if future.done():
-            return
-
-        if command_message is None:
-            return
-
-        message = event.message
-
-        if message.chat_id != chat_id:
-            return
-
-        if message.reply_to_msg_id != command_message.id:
-            return
-
-        text = message.raw_text or ""
-
-        if not is_factory_message(text):
-            return
-
-        if not message.buttons:
-            return
-
-        print("[FACTORY] Valid direct reply detected")
-        print("[FACTORY] Reply ID:", message.id)
-
-        future.set_result(message)
-
-    new_builder = events.NewMessage(chats=chat_id)
-    edit_builder = events.MessageEdited(chats=chat_id)
-
-    client.add_event_handler(check_factory, new_builder)
-    client.add_event_handler(check_factory, edit_builder)
-
-    try:
-
-        print("[1] Sending factory command...")
-
-        command_message = await client.send_message(
-            chat_id,
-            "کارخونه"
-        )
-
-        print("[1] Factory command ID:", command_message.id)
-        print("[1] Waiting for direct reply...")
-
-        result = await asyncio.wait_for(
-            future,
-            timeout=timeout
-        )
-
-        return result
-
-    finally:
-
-        client.remove_event_handler(
-            check_factory,
-            new_builder
-        )
-
-        client.remove_event_handler(
-            check_factory,
-            edit_builder
-        )
-
-
-# =========================================================
-# 6. MARKET MESSAGE DETECTION
-# =========================================================
-
-
-
-
-async def wait_for_market(
-    chat_id,
-    product,
-    factory_message_id,
-    timeout=60
-):
-
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-
-    def is_valid_market(message):
-
-        text = message.raw_text or ""
-
-        if get_market_product_price(text, product) is None:
-            return False
-
-        if not message.buttons:
-            return False
-
+def is_admin(user_id):
+    if is_owner(user_id):
         return True
 
-    async def check_market(event):
+    return db.execute(
+        "SELECT 1 FROM admins WHERE user_id=?",
+        (user_id,)
+    ).fetchone() is not None
 
-        if future.done():
-            return
 
-        message = event.message
+def is_global_enabled():
+    row = db.execute(
+        "SELECT value FROM settings WHERE key='global_enabled'"
+    ).fetchone()
 
-        if message.chat_id != chat_id:
-            return
+    return True if row is None else row["value"] == "1"
 
-        if message.id < factory_message_id:
-            return
 
-        if not is_valid_market(message):
-            return
+def set_global_enabled(value):
+    db.execute("""
+        INSERT INTO settings(key, value)
+        VALUES('global_enabled', ?)
+        ON CONFLICT(key)
+        DO UPDATE SET value=excluded.value
+    """, ("1" if value else "0",))
+    db.commit()
 
-        if future.done():
-            return
 
-        print("[MARKET] Valid market panel detected")
-        print("[MARKET] Message ID:", message.id)
+def subscription_status(user_id):
+    user = get_user(user_id)
 
-        future.set_result(message)
+    if not is_global_enabled():
+        return False, "سرویس موقتاً توسط مالک غیرفعال شده است."
 
-    new_builder = events.NewMessage(chats=chat_id)
-    edit_builder = events.MessageEdited(chats=chat_id)
+    if not user["enabled"]:
+        return False, "دسترسی حساب توسط مدیریت غیرفعال شده است."
 
-    client.add_event_handler(check_market, new_builder)
-    client.add_event_handler(check_market, edit_builder)
+    if user["expires_at"] <= now():
+        return False, "اشتراک فعال ندارید یا اشتراک شما منقضی شده است."
 
-    try:
+    remaining = user["expires_at"] - now()
+    days = remaining // 86400
+    hours = (remaining % 86400) // 3600
 
-        print("[4] Waiting for market panel...")
+    return True, f"اشتراک فعال است؛ {days} روز و {hours} ساعت باقی مانده."
 
-        recent_messages = await client.get_messages(
-            chat_id,
-            limit=20
-        )
 
-        for message in recent_messages:
+def activate_user(user_id, days):
+    if days <= 0:
+        raise ValueError("مدت اشتراک باید بیشتر از صفر باشد.")
 
-            # اگر رویداد تلگرام قبلاً پیام را پیدا کرده،
-            # دیگر Future را دوباره تکمیل نکن.
-            if future.done():
-                break
+    ensure_user(user_id)
 
-            if message.id < factory_message_id:
-                continue
+    user = get_user(user_id)
+    start = max(now(), user["expires_at"])
 
-            if is_valid_market(message):
+    db.execute("""
+        UPDATE users
+        SET expires_at=?, enabled=1
+        WHERE user_id=?
+    """, (start + days * 86400, user_id))
 
-                if not future.done():
+    db.commit()
 
-                    print("[MARKET] Existing market panel detected")
-                    print("[MARKET] Message ID:", message.id)
 
-                    future.set_result(message)
+def create_code(days, creator):
+    if not 1 <= days <= 3650:
+        raise ValueError("مدت کد باید بین ۱ تا ۳۶۵۰ روز باشد.")
 
-                break
-
-        result = await asyncio.wait_for(
-            future,
-            timeout=timeout
-        )
-
-        return result
-
-    finally:
-
-        client.remove_event_handler(
-            check_market,
-            new_builder
-        )
-
-        client.remove_event_handler(
-            check_market,
-            edit_builder
-        )
-
-
-
-# =========================================================
-# 7. BUTTON UTILITIES
-# =========================================================
-
-def flatten_buttons(message):
-
-    result = []
-
-    if not message.buttons:
-        return result
-
-    for row_index, row in enumerate(message.buttons):
-
-        for column_index, button in enumerate(row):
-
-            result.append(
-                (row_index, column_index, button)
-            )
-
-    return result
-
-
-async def click_market_button(message):
-
-    if not message.buttons:
-        raise RuntimeError(
-            "پیام کارخانه هیچ دکمه‌ای ندارد."
-        )
-
-    # اولین ردیف، آخرین ستون
-    row = 0
-    column = len(message.buttons[0]) - 1
-
-    button = message.buttons[row][column]
-
-    print(
-        "[3] Market button:",
-        getattr(button, "text", "Unknown")
-    )
-
-    await message.click(row, column)
-
-    print("[3] Market button clicked successfully")
-
-async def click_final_button(message):
-
-    buttons = flatten_buttons(message)
-
-    if len(buttons) < 3:
-        raise RuntimeError(
-            "کمتر از سه دکمه در پنل بازار وجود دارد."
-        )
-
-    # دقیقاً همان روش نسخه اولیه
-    row, column, button = buttons[-3]
-
-    print(
-        "[6] Final button:",
-        getattr(button, "text", "Unknown")
-    )
-
-    await message.click(row, column)
-
-    print("[6] Final button clicked successfully")
-
-
-
-# =========================================================
-# 8. FACTORY CYCLE
-# =========================================================
-
-async def run_cycle(chat_id, test=False):
-
-    config = get_settings(chat_id)
-
-    async with get_lock(chat_id):
-
-        print("\n" + "=" * 45)
-        print("NEW CYCLE")
-        print("TEST MODE:", test)
-        print("=" * 45)
-
-        if test:
-
-            await send_report(
-                chat_id,
-                "🧪 تست کامل شروع شد.\n"
-                "شرط انبار و قیمت نادیده گرفته می‌شوند.\n"
-                "توجه: کلیک نهایی هم انجام خواهد شد."
-            )
-
-        # ---------------------------------------------
-        # STEP 1 - FACTORY
-        # ---------------------------------------------
-
-        print("\n[1] FACTORY")
-
-        factory_message = await send_factory_and_wait(
-            chat_id,
-            timeout=60
-        )
-
-        print("[OK] Factory message received")
-
-        # ---------------------------------------------
-        # STEP 2 - WAREHOUSE
-        # ---------------------------------------------
-
-        print("\n[2] WAREHOUSE")
-
-        warehouse = get_warehouse(
-            factory_message.raw_text or ""
-        )
-
-        if warehouse is None:
-
-            raise RuntimeError(
-                "اطلاعات انبار قابل استخراج نیست."
-            )
-
-        current, maximum = warehouse
-
-        print(
-            f"Warehouse: {current}/{maximum}"
-        )
-
-        if not test:
-
-            required = config["warehouse_capacity"]
-
-            if (
-                current != required
-                or maximum != required
-            ):
-
-                await send_report(
-                    chat_id,
-                    f"⏸ انبار کامل نیست.\n"
-                    f"مقدار فعلی: {current}/{maximum}\n"
-                    f"ظرفیت مورد انتظار: {required}\n"
-                    f"{config['interval'] // 60} دقیقه دیگر دوباره بررسی می‌کنم."
-                )
-
-                return False
-
-        # ---------------------------------------------
-        # STEP 3 - OPEN MARKET
-        # ---------------------------------------------
-
-        print("\n[3] OPEN MARKET")
-
-        await click_market_button(
-            factory_message
-        )
-
-        # ---------------------------------------------
-        # STEP 4 - FIND PRODUCT
-        # ---------------------------------------------
-
-        product = str(config["product"]).strip()
-
-        if not product:
-
-            raise RuntimeError(
-                "نام محصول در تنظیمات خالی است."
-            )
-
-        print("\n[4] FIND PRODUCT:", product)
-
-        market_message = await wait_for_market(
-            chat_id=chat_id,
-            product=product,
-            factory_message_id=factory_message.id,
-            timeout=60
-        )
-
-        # ---------------------------------------------
-        # STEP 5 - CHECK PRICE
-        # ---------------------------------------------
-
-        print("\n[5] CHECK PRICE")
-
-        price = get_market_product_price(
-            market_message.raw_text or "",
-            product
-        )
-
-        if price is None:
-
-            raise RuntimeError(
-                "قیمت محصول قابل تشخیص نیست."
-            )
-
-        print(
-            f"Current price: {price:,}"
-        )
-
-        # Test runs do not pollute the model's training history.
-        if not test:
-
-            prediction_report = update_price_learning_and_report(
-                chat_id,
-                product,
-                price
-            )
-
-            await send_report(
-                chat_id,
-                prediction_report
-            )
-
-        if not test:
-
-            minimum = config["min_price"]
-
-            if price < minimum:
-
-                await send_report(
-                    chat_id,
-                    f"⏸ قیمت مناسب نیست.\n"
-                    f"قیمت فعلی: {price:,}\n"
-                    f"حداقل قیمت: {minimum:,}\n"
-                    f"{config['interval'] // 60} دقیقه دیگر بررسی می‌کنم."
-                )
-
-                return False
-
-        # ---------------------------------------------
-        # STEP 6 - FINAL BUTTON
-        # ---------------------------------------------
-
-        print("\n[6] FINAL BUTTON")
-
-        await click_final_button(
-            market_message
-        )
-
-        # ---------------------------------------------
-        # RESULT
-        # ---------------------------------------------
-
-        if test:
-
-            await send_report(
-                chat_id,
-                "🧪 مراحل تست اجرا شدند.\n"
-                "کلیک نهایی نیز ارسال شد."
-            )
-
-        else:
-
-            await send_report(
-                chat_id,
-                f"✅ عملیات انجام شد.\n"
-                f"محصول: {product}\n"
-                f"قیمت: {price:,}"
-            )
-
-        print("\nCYCLE COMPLETED")
-
-        return True
-
-
-# =========================================================
-# 9. AUTOMATIC LOOP
-# =========================================================
-
-async def automatic_loop(chat_id):
-
-    print(
-        f"[AUTO] Started for group {chat_id}"
-    )
+    alphabet = string.ascii_uppercase + string.digits
 
     while True:
+        code = "MAFIA-" + "".join(
+            secrets.choice(alphabet) for _ in range(12)
+        )
+
+        exists = db.execute(
+            "SELECT 1 FROM codes WHERE code=?",
+            (code,)
+        ).fetchone()
+
+        if not exists:
+            break
+
+    db.execute("""
+        INSERT INTO codes
+        (code, days, created_by, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (code, days, creator, now()))
+
+    db.commit()
+    return code
+
+
+def redeem_code(user_id, code):
+    code = code.strip().upper()
+
+    row = db.execute(
+        "SELECT * FROM codes WHERE code=?",
+        (code,)
+    ).fetchone()
+
+    if row is None:
+        return False, "کد واردشده معتبر نیست."
+
+    if row["used_by"] is not None:
+        return False, "این کد قبلاً استفاده شده است."
+
+    activate_user(user_id, row["days"])
+
+    db.execute("""
+        UPDATE codes
+        SET used_by=?, used_at=?
+        WHERE code=? AND used_by IS NULL
+    """, (user_id, now(), code))
+
+    if db.execute("SELECT changes()").fetchone()[0] != 1:
+        db.rollback()
+        return False, "این کد هم‌زمان توسط شخص دیگری استفاده شد."
+
+    db.commit()
+
+    return True, f"اشتراک {row['days']} روزه فعال شد."
+
+
+# =====================================================
+# MENUS
+# =====================================================
+
+def user_menu():
+    return [
+        [Button.inline("🎁 دریافت آزمایش رایگان", b"trial")],
+        [Button.inline("🔑 وارد کردن کد اشتراک", b"redeem")],
+        [Button.inline("💳 خرید اشتراک", b"buy")],
+        [Button.inline("📊 وضعیت اشتراک", b"status")]
+    ]
+
+
+def admin_menu():
+    return [
+        [Button.inline("🎟 ساخت کد اشتراک", b"newcode")],
+        [Button.inline("👥 کاربران", b"users")],
+        [Button.inline("📋 راهنمای دستورات", b"help")]
+    ]
+
+
+async def show_panel(event):
+    uid = event.sender_id
+
+    buttons = user_menu()
+
+    if is_admin(uid):
+        buttons += admin_menu()
+
+    if is_owner(uid):
+        buttons.append([
+            Button.inline("🟢 روشن کردن سرویس", b"global_on"),
+            Button.inline("🔴 خاموش کردن سرویس", b"global_off")
+        ])
+
+    await event.respond(
+        "🏛 MAFIA EMPIRE\n\n"
+        "پنل مدیریت اشتراک\n"
+        "یکی از گزینه‌های زیر را انتخاب کن:",
+        buttons=buttons
+    )
+
+
+# =====================================================
+# PRIVATE MESSAGES
+# =====================================================
+
+@bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
+async def message_handler(event):
+    uid = event.sender_id
+    text = (event.raw_text or "").strip()
+
+    ensure_user(uid)
+
+    # /START
+    if text.lower() in ("/start", "/panel"):
+        user_states.pop(uid, None)
+        await show_panel(event)
+        return
+
+    # USER INPUT STATES
+    state = user_states.get(uid)
+
+    if state == "redeem":
+        user_states.pop(uid, None)
+
+        ok, message = redeem_code(uid, text)
+
+        await event.respond(
+            ("✅ " if ok else "❌ ") + message
+        )
+        return
+
+    if state == "code_days":
+        user_states.pop(uid, None)
+
+        if not is_admin(uid):
+            return
 
         try:
+            days = int(text)
+            code = create_code(days, uid)
 
-            await run_cycle(
-                chat_id,
-                test=False
+            await event.respond(
+                f"✅ کد ساخته شد:\n\n"
+                f"`{code}`\n\n"
+                f"مدت: {days} روز\n"
+                f"یک‌بارمصرف است."
             )
-
-        except asyncio.CancelledError:
-
-            print("[AUTO] Stop requested")
-
-            await send_report(
-                chat_id,
-                "⏹ مدیریت خودکار کارخانه متوقف شد."
-            )
-
-            raise
 
         except Exception as error:
+            await event.respond(f"❌ خطا: {error}")
 
-            print(
-                "[AUTO ERROR]",
-                repr(error)
+        return
+
+    # ADMIN COMMANDS
+    if text.startswith("/code "):
+        if not is_admin(uid):
+            return
+
+        try:
+            days = int(text.split()[1])
+            code = create_code(days, uid)
+
+            await event.respond(
+                f"🎟 کد جدید:\n`{code}`\n"
+                f"مدت: {days} روز"
             )
+        except Exception:
+            await event.respond("فرمت صحیح:\n/code 10")
 
-            await send_report(
-                chat_id,
-                f"⚠️ خطا در اجرای عملیات:\n"
-                f"{error}\n\n"
-                f"در تلاش بعدی دوباره بررسی می‌کنم."
+        return
+
+    if text.startswith("/on ") or text.startswith("/off "):
+        if not is_admin(uid):
+            return
+
+        try:
+            parts = text.split()
+            target = int(parts[1])
+            enabled = parts[0] == "/on"
+
+            ensure_user(target)
+
+            db.execute(
+                "UPDATE users SET enabled=? WHERE user_id=?",
+                (int(enabled), target)
             )
+            db.commit()
 
-        interval_event = get_interval_event(chat_id)
-
-        while True:
-
-            interval_event.clear()
-
-            interval = get_settings(chat_id)["interval"]
-
-            print(
-                f"[AUTO] Next cycle in {interval // 60} minutes"
+            await event.respond(
+                f"وضعیت حساب {target}: "
+                f"{'فعال' if enabled else 'غیرفعال'}"
             )
 
             try:
-
-                await asyncio.wait_for(
-                    interval_event.wait(),
-                    timeout=interval
+                await bot.send_message(
+                    target,
+                    "🟢 دسترسی شما فعال شد."
+                    if enabled else
+                    "🔴 دسترسی شما توسط مدیریت غیرفعال شد."
                 )
+            except Exception:
+                pass
 
-                print(
-                    "[AUTO] Interval changed; restarting countdown"
-                )
+        except Exception:
+            await event.respond("فرمت صحیح:\n/on USER_ID\n/off USER_ID")
 
-            except asyncio.TimeoutError:
+        return
 
-                break
-
-
-# =========================================================
-# 10. TEST
-# =========================================================
-
-async def test_once(chat_id):
-
-    try:
-
-        await run_cycle(
-            chat_id,
-            test=True
-        )
-
-    except asyncio.CancelledError:
-
-        raise
-
-    except Exception as error:
-
-        print(
-            "[TEST ERROR]",
-            repr(error)
-        )
-
-        await send_report(
-            chat_id,
-            f"❌ تست ناموفق بود:\n{error}"
-        )
-
-
-# =========================================================
-# COMMAND UTILITIES
-# =========================================================
-
-async def send_report(chat_id, message):
-
-    try:
-
-        await client.send_message(
-            "me",
-            f"📍 گروه: `{chat_id}`\n"
-            f"━━━━━━━━━━━━━━━━━━\n\n"
-            f"{message}"
-        )
-
-    except Exception as error:
-
-        print(
-            "[REPORT ERROR]",
-            repr(error)
-        )
-
-
-def schedule_command_delete(event):
-
-    async def delete_command():
-
-        await asyncio.sleep(0.5)
+    # OWNER COMMANDS
+    if text.startswith("/approve "):
+        if not is_owner(uid):
+            return
 
         try:
+            _, target, days = text.split()
+            target = int(target)
+            days = int(days)
 
-            await event.delete()
+            activate_user(target, days)
+
+            db.execute("""
+                UPDATE purchases
+                SET status='approved', approved_days=?
+                WHERE user_id=?
+            """, (days, target))
+            db.commit()
+
+            await event.respond(
+                f"✅ اشتراک {target} به مدت {days} روز فعال شد."
+            )
+
+            await bot.send_message(
+                target,
+                f"🎉 درخواست خرید شما تأیید شد.\n"
+                f"اشتراک {days} روزه فعال شد."
+            )
 
         except Exception as error:
-
-            print(
-                "[COMMAND DELETE ERROR]",
-                repr(error)
-            )
-
-    asyncio.create_task(delete_command())
-
-
-# =========================================================
-# 11. COMMAND HANDLER
-# =========================================================
-
-@client.on(
-    events.NewMessage(
-        outgoing=True,
-        pattern=r"(?i)^/(GO|OFF|TEST|INFO|P|MIN|CAP|TIME|PREDICT|HELP|START|STOP|STATUS|PRODUCT|PRICE|CAPACITY|INTERVAL)(?:\s+.*)?$"
-    )
-)
-async def command_handler(event):
-
-    if not event.is_group:
-        return
-
-    raw_text = (event.raw_text or "").strip()
-
-    if not raw_text:
-        return
-
-    parts = raw_text.split(maxsplit=1)
-
-    command = parts[0].upper()
-
-    argument = (
-        parts[1].strip()
-        if len(parts) > 1
-        else ""
-    )
-
-    aliases = {
-        "/GO": "/START",
-        "/OFF": "/STOP",
-        "/INFO": "/STATUS",
-        "/P": "/PRODUCT",
-        "/MIN": "/PRICE",
-        "/CAP": "/CAPACITY",
-        "/TIME": "/INTERVAL"
-    }
-
-    command = aliases.get(command, command)
-
-    valid_commands = {
-        "/START",
-        "/STOP",
-        "/TEST",
-        "/STATUS",
-        "/PRODUCT",
-        "/PRICE",
-        "/CAPACITY",
-        "/INTERVAL",
-        "/PREDICT",
-        "/HELP"
-    }
-
-    if command not in valid_commands:
-        return
-
-    chat_id = event.chat_id
-
-    schedule_command_delete(event)
-
-    config = get_settings(chat_id)
-
-    # -----------------------------------------------------
-    # START
-    # -----------------------------------------------------
-
-    if command == "/START":
-
-        task = tasks.get(chat_id)
-
-        if task and not task.done():
-
-            await send_report(
-                chat_id,
-                "⚠️ مدیریت خودکار از قبل فعال است."
-            )
-
-            return
-
-        tasks[chat_id] = asyncio.create_task(
-            automatic_loop(chat_id)
-        )
-
-        await send_report(
-            chat_id,
-            "🚀 مدیریت خودکار فعال شد."
-        )
-
-    # -----------------------------------------------------
-    # STOP
-    # -----------------------------------------------------
-
-    elif command == "/STOP":
-
-        task = tasks.get(chat_id)
-
-        if task and not task.done():
-
-            task.cancel()
-
-            await send_report(
-                chat_id,
-                "⏹ درخواست توقف ارسال شد."
-            )
-
-        else:
-
-            await send_report(
-                chat_id,
-                "مدیریت خودکار فعال نیست."
-            )
-
-    # -----------------------------------------------------
-    # TEST
-    # -----------------------------------------------------
-
-    elif command == "/TEST":
-
-        task = tasks.get(chat_id)
-
-        if task and not task.done():
-
-            await send_report(
-                chat_id,
-                "⚠️ ابتدا /OFF را اجرا کن."
-            )
-
-            return
-
-        tasks[chat_id] = asyncio.create_task(
-            test_once(chat_id)
-        )
-
-        await send_report(
-            chat_id,
-            "🧪 تست کامل آغاز شد.\n"
-            "توجه: این تست کلیک نهایی را هم انجام می‌دهد."
-        )
-
-    # -----------------------------------------------------
-    # STATUS
-    # -----------------------------------------------------
-
-    elif command == "/STATUS":
-
-        task = tasks.get(chat_id)
-
-        running = (
-            task is not None
-            and not task.done()
-        )
-
-        await send_report(
-            chat_id,
-            f"📊 وضعیت: "
-            f"{'فعال' if running else 'متوقف'}\n\n"
-            f"محصول: {config['product']}\n"
-            f"حداقل قیمت: {config['min_price']:,}\n"
-            f"ظرفیت انبار: "
-            f"{config['warehouse_capacity']}\n"
-            f"فاصله بررسی: "
-            f"{config['interval'] // 60} دقیقه"
-        )
-
-    # -----------------------------------------------------
-    # PRODUCT
-    # -----------------------------------------------------
-
-    elif command == "/PRODUCT":
-
-        if not argument:
-
-            await send_report(
-                chat_id,
-                "فرمت صحیح:\n/P نام محصول"
-            )
-
-            return
-
-        config["product"] = argument
-
-        save_settings()
-
-        await send_report(
-            chat_id,
-            f"✅ محصول تنظیم شد:\n{argument}"
-        )
-
-    # -----------------------------------------------------
-    # PRICE
-    # -----------------------------------------------------
-
-    elif command == "/PRICE":
-
-        try:
-
-            value = clean_number(argument)
-
-            if value < 0:
-                raise ValueError
-
-            config["min_price"] = value
-
-            save_settings()
-
-            await send_report(
-                chat_id,
-                f"✅ حداقل قیمت تنظیم شد:\n{value:,}"
-            )
-
-        except ValueError:
-
-            await send_report(
-                chat_id,
-                "فرمت صحیح:\n/MIN 393400"
-            )
-
-    # -----------------------------------------------------
-    # CAPACITY
-    # -----------------------------------------------------
-
-    elif command == "/CAPACITY":
-
-        try:
-
-            value = clean_number(argument)
-
-            if value <= 0:
-                raise ValueError
-
-            config["warehouse_capacity"] = value
-
-            save_settings()
-
-            await send_report(
-                chat_id,
-                f"✅ ظرفیت انبار تنظیم شد:\n{value}"
-            )
-
-        except ValueError:
-
-            await send_report(
-                chat_id,
-                "فرمت صحیح:\n/CAP 350"
-            )
-
-    # -----------------------------------------------------
-    # INTERVAL
-    # -----------------------------------------------------
-
-    elif command == "/INTERVAL":
-
-        try:
-
-            value = clean_number(argument)
-
-            if value <= 0:
-                raise ValueError
-
-            config["interval"] = value * 60
-
-            save_settings()
-
-            get_interval_event(chat_id).set()
-
-            await send_report(
-                chat_id,
-                f"✅ فاصله بررسی تنظیم شد:\n"
-                f"{value} دقیقه"
-            )
-
-        except ValueError:
-
-            await send_report(
-                chat_id,
-                "فرمت صحیح:\n/TIME 30"
-            )
-
-    # -----------------------------------------------------
-    # PRICE PREDICTION
-    # -----------------------------------------------------
-
-    elif command == "/PREDICT":
-
-        product = str(config["product"]).strip()
-
-        if not product or product == "نام محصول":
-
-            await send_report(
-                chat_id,
-                "⚠️ ابتدا محصول را تنظیم کن:\n/P نام محصول"
-            )
-
-            return
-
-        await send_report(
-            chat_id,
-            format_price_prediction(
-                chat_id,
-                product,
-                config["interval"]
-            )
-        )
-
-    # -----------------------------------------------------
-    # HELP
-    # -----------------------------------------------------
-
-    elif command == "/HELP":
-
-        await send_report(
-            chat_id,
-            """
-📋 MAFIA EMPIRE AUTO MANAGER
-
-━━━━━━━━━━━━━━━━━━
-🏭 FACTORY MANAGER
-━━━━━━━━━━━━━━━━━━
-
-/GO - شروع مدیریت خودکار
-/OFF - توقف مدیریت خودکار
-/TEST - اجرای تست کامل
-/INFO - مشاهده وضعیت
-
-/P نام محصول - تعیین محصول
-/MIN عدد - تعیین حداقل قیمت
-/CAP عدد - تعیین ظرفیت انبار
-/TIME عدد - تعیین فاصله بررسی (دقیقه)
-/PREDICT - مشاهده پیش‌بینی قیمت یک ساعت آینده
-
-━━━━━━━━━━━━━━━━━━
-⚔️ AUTO BATTLE
-━━━━━━━━━━━━━━━━━━
-
-/W کلمه
-
-تعیین کلمه عملیات.
-نیازی به Reply نیست.
-
-مثال:
-/W سلام
-
-/N
-
-شروع Auto Battle برای شخص موردنظر.
-
-نحوه استفاده:
-1. پیام شخص موردنظر را پیدا کن.
-2. روی پیام او Reply کن.
-3. دستور /N را ارسال کن.
-
-هر شخص عملیات مستقل خودش را دارد.
-
-/NX
-
-توقف Auto Battle شخص موردنظر.
-
-نحوه استفاده:
-1. روی پیام همان شخص Reply کن.
-2. دستور /NX را ارسال کن.
-
-با این دستور فقط عملیات همان شخص متوقف می‌شود.
-عملیات اشخاص دیگر ادامه پیدا می‌کند.
-
-━━━━━━━━━━━━━━━━━━
-📨 REPORTS
-━━━━━━━━━━━━━━━━━━
-
-تمام گزارش‌ها، خطاها، نتایج عملیات
-و پیام‌های توقف در Saved Messages ارسال می‌شوند.
-
-تنظیمات کارخانه برای هر گروه جداگانه ذخیره می‌شوند.
-"""
-        )
-
-
-# =========================================================
-# 12. AUTO BATTLE SYSTEM
-# =========================================================
-
-BATTLE_SETTINGS_FILE = DATA_DIR / "mafia_battle_settings.json"
-
-battle_settings = {}
-battle_tasks = {}
-battle_settings_loaded = False
-
-
-# ---------------------------------------------------------
-# SETTINGS
-# ---------------------------------------------------------
-
-def load_battle_settings():
-
-    global battle_settings_loaded, battle_settings
-
-    if battle_settings_loaded:
-        return
-
-    battle_settings_loaded = True
-
-    if not BATTLE_SETTINGS_FILE.exists():
-        battle_settings = {}
-        return
-
-    try:
-
-        data = json.loads(
-            BATTLE_SETTINGS_FILE.read_text(
-                encoding="utf-8"
-            )
-        )
-
-        battle_settings = (
-            data if isinstance(data, dict) else {}
-        )
-
-    except Exception as error:
-
-        print("[BATTLE SETTINGS ERROR]", repr(error))
-        battle_settings = {}
-
-
-def save_battle_settings():
-
-    BATTLE_SETTINGS_FILE.write_text(
-        json.dumps(
-            battle_settings,
-            ensure_ascii=False,
-            indent=4
-        ),
-        encoding="utf-8"
-    )
-
-
-def get_battle_word(chat_id):
-
-    load_battle_settings()
-
-    return battle_settings.get(str(chat_id), {}).get(
-        "word", ""
-    )
-
-
-def set_battle_word(chat_id, word):
-
-    load_battle_settings()
-
-    key = str(chat_id)
-
-    if key not in battle_settings:
-        battle_settings[key] = {}
-
-    battle_settings[key]["word"] = word
-
-    save_battle_settings()
-
-
-# ---------------------------------------------------------
-# FIND LAST ACCOUNT MESSAGE
-# ---------------------------------------------------------
-
-async def get_last_account_message(
-    chat_id,
-    target_user_id,
-    before_id=None
-):
-
-    kwargs = {}
-
-    if before_id is not None:
-        kwargs["max_id"] = before_id
-
-    async for message in client.iter_messages(
-        chat_id,
-        limit=100,
-        from_user=target_user_id,
-        **kwargs
-    ):
-
-        text = (message.raw_text or "").strip()
-
-        if re.match(
-            r"^/(?:N|NX|W|NSTOP|WORD)\b",
-            text,
-            re.IGNORECASE
-        ):
-            continue
-
-        return message
-
-    return None
-
-
-# ---------------------------------------------------------
-# EXTRACT WIN PERCENTAGE
-# ---------------------------------------------------------
-
-def get_battle_percentage(text):
-
-    text = normalize_market_line(text or "")
-
-    text = normalize_digits(text)
-
-    match = re.search(
-        r"برآورد\s*برد\s*[:：]\s*(\d{1,3})\s*(?:٪|%)?",
-        text
-    )
-
-    if not match:
-        return None
-
-    percentage = int(match.group(1))
-
-    if not 0 <= percentage <= 100:
-        return None
-
-    return percentage
-
-
-# ---------------------------------------------------------
-# WAIT FOR GAME REPLY
-# ---------------------------------------------------------
-
-async def wait_for_battle_reply(
-    chat_id,
-    sent_message_id,
-    timeout=90
-):
-
-    loop = asyncio.get_running_loop()
-
-    future = loop.create_future()
-
-    async def check_reply(event):
-
-        if future.done():
-            return
-
-        message = event.message
-
-        if message.chat_id != chat_id:
-            return
-
-        if message.reply_to_msg_id != sent_message_id:
-            return
-
-        text = message.raw_text or ""
-
-        percentage = get_battle_percentage(text)
-
-        if percentage is None:
-            return
-
-        if not message.buttons:
-            return
-
-        print("[BATTLE] Game reply detected")
-        print("[BATTLE] Percentage:", percentage)
-
-        future.set_result(message)
-
-    new_builder = events.NewMessage(chats=chat_id)
-
-    edit_builder = events.MessageEdited(chats=chat_id)
-
-    client.add_event_handler(
-        check_reply,
-        new_builder
-    )
-
-    client.add_event_handler(
-        check_reply,
-        edit_builder
-    )
-
-    try:
-
-        result = await asyncio.wait_for(
-            future,
-            timeout=timeout
-        )
-
-        return result
-
-    finally:
-
-        client.remove_event_handler(
-            check_reply,
-            new_builder
-        )
-
-        client.remove_event_handler(
-            check_reply,
-            edit_builder
-        )
-
-
-# ---------------------------------------------------------
-# CLICK LEFT / RIGHT BUTTON
-# ---------------------------------------------------------
-
-async def click_battle_button(message, side):
-
-    buttons = message.buttons
-
-    if not buttons or len(buttons[0]) < 2:
-
-        raise RuntimeError(
-            "دکمه چپ و راست به‌صورت مجزا پیدا نشد."
-        )
-
-    if side == "LEFT":
-
-        row = 0
-        column = 0
-
-    elif side == "RIGHT":
-
-        row = 0
-        column = len(buttons[0]) - 1
-
-    else:
-
-        raise ValueError("Invalid button side")
-
-    button = buttons[row][column]
-
-    print(
-        "[BATTLE] Clicking:",
-        side,
-        getattr(button, "text", "Unknown")
-    )
-
-    await message.click(row, column)
-
-
-# ---------------------------------------------------------
-# ONE BATTLE CYCLE
-# ---------------------------------------------------------
-
-async def run_battle_cycle(
-    chat_id,
-    target_user_id,
-    before_id=None
-):
-
-    word = get_battle_word(chat_id)
-
-    if not word:
-
-        raise RuntimeError(
-            "ابتدا با دستور /W کلمه را تعیین کن."
-        )
-
-    last_message = await get_last_account_message(
-        chat_id,
-        target_user_id=target_user_id,
-        before_id=before_id
-    )
-
-    if last_message is None:
-
-        raise RuntimeError(
-            "پیام قبلی اکانت فیک پیدا نشد."
-        )
-
-    print(
-        "[BATTLE] Replying to message:",
-        last_message.id
-    )
-
-    sent_message = await client.send_message(
-        chat_id,
-        word,
-        reply_to=last_message.id
-    )
-
-    print("[BATTLE] Word sent:", word)
-
-    game_message = await wait_for_battle_reply(
-        chat_id,
-        sent_message.id,
-        timeout=90
-    )
-
-    percentage = get_battle_percentage(
-        game_message.raw_text or ""
-    )
-
-    if percentage is None:
-
-        raise RuntimeError(
-            "درصد برد قابل تشخیص نیست."
-        )
-
-    print(
-        "[BATTLE] Win percentage:",
-        percentage
-    )
-
-    if percentage >= 50:
-
-        print("[BATTLE] Result: 50% OR HIGHER")
-
-        await click_battle_button(
-            game_message,
-            "LEFT"
-        )
-
-        return True
-
-    else:
-
-        print("[BATTLE] Result: BELOW 50%")
-
-        await click_battle_button(
-            game_message,
-            "RIGHT"
-        )
-
-        return False
-
-
-# ---------------------------------------------------------
-# AUTOMATIC BATTLE LOOP
-# ---------------------------------------------------------
-
-async def automatic_battle_loop(
-    chat_id,
-    command_message_id,
-    target_user_id
-):
-
-    print("\n[BATTLE] AUTOMATIC SYSTEM STARTED")
-    print("[BATTLE] TARGET:", target_user_id)
-
-    first_cycle = True
-
-    try:
-
-        while True:
-
-            if first_cycle:
-
-                before_id = command_message_id
-
-            else:
-
-                before_id = None
-
-            first_cycle = False
-
-            result = await run_battle_cycle(
-                chat_id,
-                target_user_id=target_user_id,
-                before_id=before_id
-            )
-
-            if not result:
-
-                await send_report(
-                    chat_id,
-                    f"🛑 عملیات متوقف شد.\n"
-                    f"شخص هدف: `{target_user_id}`\n"
-                    f"درصد برد کمتر از ۵۰٪ بود.\n"
-                    f"برای شروع مجدد روی پیام شخص Reply کن و /N را اجرا کن."
-                )
-
-                print("[BATTLE] AUTOMATIC SYSTEM STOPPED")
-
-                return
-
-            delay = random.randint(360, 600)
-
-            print(
-                f"[BATTLE] Next cycle in "
-                f"{delay // 60} minutes"
-            )
-
-            await asyncio.sleep(delay)
-
-    except asyncio.CancelledError:
-
-        print("[BATTLE] STOP REQUESTED")
-        raise
-
-    except Exception as error:
-
-        print(
-            "[BATTLE ERROR]",
-            repr(error)
-        )
-
-        await send_report(
-            chat_id,
-            f"⚠️ عملیات متوقف شد.\n"
-            f"شخص هدف: `{target_user_id}`\n"
-            f"خطا: {error}\n"
-            f"برای شروع مجدد /N را اجرا کن."
-        )
-
-
-# ---------------------------------------------------------
-# BATTLE COMMAND HANDLER
-# ---------------------------------------------------------
-
-@client.on(
-    events.NewMessage(
-        outgoing=True,
-        pattern=r"(?i)^/(?:NX|N|W)(?:\s+.*)?$"
-    )
-)
-async def battle_command_handler(event):
-
-    if not event.is_group:
-        return
-
-    raw_text = (event.raw_text or "").strip()
-
-    parts = raw_text.split(maxsplit=1)
-
-    command = parts[0].upper()
-
-    argument = (
-        parts[1].strip()
-        if len(parts) > 1
-        else ""
-    )
-
-    chat_id = event.chat_id
-
-    # -----------------------------------------------------
-    # W - CHANGE WORD
-    # -----------------------------------------------------
-
-    if command == "/W":
-
-        if not argument:
-
-            await send_report(
-                chat_id,
-                "فرمت صحیح:\n/W کلمه"
-            )
-
-            return
-
-        set_battle_word(
-            chat_id,
-            argument
-        )
-
-        await send_report(
-            chat_id,
-            f"✅ کلمه عملیات تنظیم شد:\n{argument}"
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # N / NX REQUIRE REPLY
-    # -----------------------------------------------------
-
-    reply_message = await event.get_reply_message()
-
-    if not reply_message:
-
-        await send_report(
-            chat_id,
-            "⚠️ این دستور باید روی پیام شخص موردنظر Reply شود."
-        )
-
-        return
-
-    target_user_id = reply_message.sender_id
-
-    if not target_user_id:
-
-        await send_report(
-            chat_id,
-            "شناسه فرستنده پیام قابل تشخیص نیست."
-        )
-
-        return
-
-    # کلید مستقل برای هر شخص در هر گروه
-    task_key = (chat_id, target_user_id)
-
-    # -----------------------------------------------------
-    # N - START
-    # -----------------------------------------------------
-
-    if command == "/N":
-
-        task = battle_tasks.get(task_key)
-
-        if task and not task.done():
-
-            await send_report(
-                chat_id,
-                f"⚠️ عملیات Auto Battle برای این شخص از قبل فعال است.\n"
-                f"شناسه: `{target_user_id}`"
-            )
-
-            return
-
-        word = get_battle_word(chat_id)
-
-        if not word:
-
-            await send_report(
-                chat_id,
-                "⚠️ ابتدا کلمه را تعیین کن:\n"
-                "/W کلمه"
-            )
-
-            return
-
-        battle_tasks[task_key] = asyncio.create_task(
-            automatic_battle_loop(
-                chat_id,
-                event.id,
-                target_user_id
-            )
-        )
-
-        await send_report(
-            chat_id,
-            "🚀 سیستم Auto Battle فعال شد.\n"
-            f"شناسه شخص هدف: `{target_user_id}`\n"
-            f"کلمه: {word}\n"
-            "در انتظار پاسخ Mafia Empire..."
-        )
-
-    # -----------------------------------------------------
-    # NX - STOP
-    # -----------------------------------------------------
-
-    elif command == "/NX":
-
-        task = battle_tasks.get(task_key)
-
-        if task and not task.done():
-
-            task.cancel()
-
-            await send_report(
-                chat_id,
-                "⏹ درخواست توقف Auto Battle ارسال شد.\n"
-                f"شخص هدف: `{target_user_id}`"
-            )
-
-        else:
-
-            await send_report(
-                chat_id,
-                "سیستم Auto Battle برای این شخص فعال نیست.\n"
-                f"شناسه: `{target_user_id}`"
-            )
-
-
-# =========================================================
-# 13. TELEGRAM LOGIN BOT  (دریافت شماره و کد از طریق ربات)
-# =========================================================
-
-login = {"step": None, "phone": None, "hash": None}
-
-
-def only_digits(text):
-
-    return re.sub(r"\D", "", normalize_digits(text or ""))
-
-
-async def safe_delete(event):
-
-    try:
-        await event.delete()
-    except Exception:
-        pass
-
-
-async def stop_all_tasks():
-
-    for group in (tasks, battle_tasks):
-
-        for task in list(group.values()):
-
-            if not task.done():
-                task.cancel()
-
-
-async def finish_login(event):
-
-    login.update(step=None, phone=None, hash=None)
-
-    await safe_delete(event)  # پاک کردن پیام حاوی کد/رمز
-
-    me = await client.get_me()
-
-    await event.respond(
-        f"✅ وارد شد: {me.first_name}\n"
-        "حالا دستورات (/GO, /HELP, ...) را داخل گروه بزن."
-    )
-
-
-@bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
-async def login_handler(event):
-
-    if event.sender_id != OWNER_ID:
-        return
-
-    text = (event.raw_text or "").strip()
-    step = login["step"]
-
-    # ---------- commands ----------
-
-    if text.lower() in ("/start", "/login"):
-
-        if not client.is_connected():
-            await client.connect()
-
-        if await client.is_user_authorized():
-
-            me = await client.get_me()
-
             await event.respond(
-                f"✅ اکانت وصل است: {me.first_name}\n"
-                "برای خروج: /logout"
+                f"فرمت صحیح:\n/approve USER_ID DAYS\n\n{error}"
             )
 
+        return
+
+    if text.startswith("/reject "):
+        if not is_owner(uid):
             return
 
-        login.update(step="phone", phone=None, hash=None)
+        try:
+            target = int(text.split()[1])
+
+            db.execute("""
+                UPDATE purchases SET status='rejected'
+                WHERE user_id=?
+            """, (target,))
+            db.commit()
+
+            await bot.send_message(
+                target,
+                "❌ درخواست خرید شما رد شد."
+            )
+
+            await event.respond("درخواست رد شد.")
+
+        except Exception:
+            await event.respond("فرمت صحیح:\n/reject USER_ID")
+
+        return
+
+    if text.startswith("/admin_add "):
+        if not is_owner(uid):
+            return
+
+        try:
+            target = int(text.split()[1])
+
+            db.execute("""
+                INSERT OR IGNORE INTO admins(user_id, added_at)
+                VALUES (?, ?)
+            """, (target, now()))
+            db.commit()
+
+            await event.respond(f"✅ {target} ادمین شد.")
+
+        except Exception:
+            await event.respond("فرمت صحیح:\n/admin_add USER_ID")
+
+        return
+
+    if text.startswith("/admin_del "):
+        if not is_owner(uid):
+            return
+
+        try:
+            target = int(text.split()[1])
+
+            db.execute(
+                "DELETE FROM admins WHERE user_id=?",
+                (target,)
+            )
+            db.commit()
+
+            await event.respond(f"ادمین {target} حذف شد.")
+
+        except Exception:
+            await event.respond("فرمت صحیح:\n/admin_del USER_ID")
+
+        return
+
+    if text == "/global_off" and is_owner(uid):
+        set_global_enabled(False)
+        await event.respond("🔴 سرویس به‌صورت سراسری غیرفعال شد.")
+        return
+
+    if text == "/global_on" and is_owner(uid):
+        set_global_enabled(True)
+        await event.respond("🟢 سرویس فعال شد.")
+        return
+
+    if text == "/users" and is_admin(uid):
+        rows = db.execute("""
+            SELECT user_id, expires_at, enabled
+            FROM users ORDER BY created_at DESC LIMIT 100
+        """).fetchall()
+
+        if not rows:
+            await event.respond("کاربری ثبت نشده است.")
+            return
+
+        lines = ["👥 کاربران:\n"]
+
+        for row in rows:
+            active = (
+                row["enabled"] and row["expires_at"] > now()
+            )
+
+            lines.append(
+                f"{row['user_id']} | "
+                f"{'فعال' if active else 'غیرفعال'}"
+            )
+
+        await event.respond("\n".join(lines))
+        return
+
+
+# =====================================================
+# BUTTON HANDLER
+# =====================================================
+
+@bot.on(events.CallbackQuery)
+async def callback_handler(event):
+    uid = event.sender_id
+    data = event.data.decode("utf-8")
+
+    ensure_user(uid)
+
+    if data == "trial":
+        user = get_user(uid)
+
+        if user["trial_used"]:
+            await event.answer(
+                "آزمایش رایگان قبلاً استفاده شده است.",
+                alert=True
+            )
+            return
+
+        activate_user(uid, 1)
+
+        db.execute(
+            "UPDATE users SET trial_used=1 WHERE user_id=?",
+            (uid,)
+        )
+        db.commit()
+
+        await event.answer("آزمایش یک‌روزه فعال شد.", alert=True)
+        await event.respond("🎁 اشتراک آزمایشی یک‌روزه فعال شد.")
+        return
+
+    if data == "redeem":
+        user_states[uid] = "redeem"
+        await event.respond("🔑 کد اشتراک را ارسال کن:")
+        return
+
+    if data == "buy":
+        db.execute("""
+            INSERT INTO purchases(user_id, status, requested_at)
+            VALUES (?, 'pending', ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET status='pending', requested_at=excluded.requested_at
+        """, (uid, now()))
+        db.commit()
 
         await event.respond(
-            "📱 شماره را با کد کشور بفرست.\n"
-            "مثال: +989121234567"
+            "📨 درخواست خرید شما برای مالک ارسال شد."
         )
 
-        return
-
-    if text.lower() == "/logout":
-
-        await stop_all_tasks()
-
-        if client.is_connected() and await client.is_user_authorized():
-            await client.log_out()
-
-        login.update(step=None, phone=None, hash=None)
-
-        await event.respond("🚪 از اکانت خارج شد. برای ورود مجدد: /login")
-
-        return
-
-    if text.lower() == "/status":
-
-        ok = client.is_connected() and await client.is_user_authorized()
-
-        await event.respond("✅ متصل" if ok else "❌ متصل نیست — /login")
-
-        return
-
-    # ---------- phone ----------
-
-    if step == "phone":
-
-        phone = "+" + only_digits(text)
-
         try:
-
-            if not client.is_connected():
-                await client.connect()
-
-            sent = await client.send_code_request(phone)
-
-        except PhoneNumberInvalidError:
-
-            await event.respond("❌ شماره نامعتبر است. دوباره بفرست.")
-            return
-
-        except FloodWaitError as error:
-
-            await event.respond(
-                f"⏳ تلگرام محدودیت گذاشته. {error.seconds} ثانیه صبر کن."
+            await bot.send_message(
+                OWNER_ID,
+                f"💳 درخواست خرید جدید\n\n"
+                f"شناسه کاربر: `{uid}`\n\n"
+                f"برای تأیید:\n"
+                f"/approve {uid} 30\n\n"
+                f"برای رد:\n"
+                f"/reject {uid}"
             )
+        except Exception:
+            pass
+
+        return
+
+    if data == "status":
+        active, message = subscription_status(uid)
+        await event.respond(
+            ("🟢 " if active else "🔴 ") + message
+        )
+        return
+
+    if data == "newcode":
+        if not is_admin(uid):
+            await event.answer("دسترسی ندارید.", alert=True)
             return
 
-        login.update(step="code", phone=phone, hash=sent.phone_code_hash)
+        user_states[uid] = "code_days"
+        await event.respond(
+            "مدت کد را به روز وارد کن.\nمثال: 10"
+        )
+        return
+
+    if data == "users":
+        if not is_admin(uid):
+            return
+
+        rows = db.execute("""
+            SELECT user_id, expires_at, enabled
+            FROM users ORDER BY created_at DESC LIMIT 100
+        """).fetchall()
+
+        lines = ["👥 فهرست کاربران:\n"]
+
+        for row in rows:
+            active = (
+                row["enabled"] and row["expires_at"] > now()
+            )
+
+            lines.append(
+                f"{row['user_id']} — "
+                f"{'فعال' if active else 'غیرفعال'}"
+            )
+
+        await event.respond("\n".join(lines))
+        return
+
+    if data == "help":
+        if not is_admin(uid):
+            return
 
         await event.respond(
-            "📨 کد به تلگرام اکانت ارسال شد.\n\n"
-            "⚠️ کد را با خط تیره یا فاصله بفرست، مثلاً: 1-2-3-4-5\n"
-            "(اگر کد را پشت‌سرهم بفرستی تلگرام آن را باطل می‌کند)"
+            "دستورات مدیریت:\n\n"
+            "/code 10 — ساخت کد ۱۰ روزه\n"
+            "/on USER_ID — فعال‌سازی حساب\n"
+            "/off USER_ID — غیرفعال‌سازی حساب\n"
+            "/users — فهرست کاربران\n\n"
+            "دستورات مخصوص مالک:\n"
+            "/approve USER_ID DAYS\n"
+            "/reject USER_ID\n"
+            "/admin_add USER_ID\n"
+            "/admin_del USER_ID\n"
+            "/global_on\n"
+            "/global_off"
         )
-
         return
 
-    # ---------- code ----------
-
-    if step == "code":
-
-        code = only_digits(text)
-
-        try:
-
-            await client.sign_in(
-                phone=login["phone"],
-                code=code,
-                phone_code_hash=login["hash"]
-            )
-
-        except SessionPasswordNeededError:
-
-            login["step"] = "password"
-
-            await safe_delete(event)
-
-            await event.respond("🔐 رمز تأیید دومرحله‌ای را بفرست.")
-
-            return
-
-        except PhoneCodeInvalidError:
-
-            await event.respond("❌ کد اشتباه است. دوباره بفرست.")
-            return
-
-        except PhoneCodeExpiredError:
-
-            login.update(step=None, phone=None, hash=None)
-
-            await event.respond("⌛ کد منقضی شد. دوباره /login بزن.")
-            return
-
-        await finish_login(event)
-
+    if data == "global_on" and is_owner(uid):
+        set_global_enabled(True)
+        await event.respond("🟢 سرویس فعال شد.")
         return
 
-    # ---------- 2FA password ----------
-
-    if step == "password":
-
-        try:
-
-            await client.sign_in(password=text)
-
-        except PasswordHashInvalidError:
-
-            await event.respond("❌ رمز اشتباه است. دوباره بفرست.")
-            return
-
-        await finish_login(event)
-
+    if data == "global_off" and is_owner(uid):
+        set_global_enabled(False)
+        await event.respond("🔴 سرویس خاموش شد.")
         return
 
-    await event.respond("برای اتصال اکانت: /login")
+    await event.answer("دستور نامعتبر است.", alert=True)
 
 
-# =========================================================
-# 14. MAIN
-# =========================================================
+# =====================================================
+# MAIN
+# =====================================================
 
 async def main():
-
-    load_settings()
-    load_price_history()
-
-    print("=" * 50)
-    print("MAFIA EMPIRE AUTO MANAGER")
-    print("=" * 50)
-
     await bot.start(bot_token=BOT_TOKEN)
-    await client.connect()
 
-    if await client.is_user_authorized():
+    print("MAFIA LICENSE SERVICE STARTED")
+    print("OWNER:", OWNER_ID)
+    print("DATABASE:", DB_PATH)
 
-        me = await client.get_me()
-
-        print("\nCONNECTED SUCCESSFULLY")
-        print("Account:", me.first_name)
-        print("Username:", me.username)
-
-        message = f"✅ سرویس بالا آمد و اکانت وصل است: {me.first_name}"
-
-    else:
-
-        print("Not logged in; waiting for /login via bot")
-
-        message = "⚠️ اکانت وصل نیست. /login را بزن."
-
-    try:
-
-        await bot.send_message(OWNER_ID, message)
-
-    except Exception as error:
-
-        print("[BOT NOTIFY ERROR]", repr(error))
-
-    print("=" * 50)
-    print("Waiting for group commands...")
-    print("=" * 50)
+    await bot.send_message(
+        OWNER_ID,
+        "✅ سیستم مدیریت اشتراک فعال شد."
+    )
 
     await bot.run_until_disconnected()
 
 
 if __name__ == "__main__":
-
-    try:
-
-        asyncio.run(main())
-
-    except KeyboardInterrupt:
-
-        print("\nProgram stopped.")
-
-    except Exception as error:
-
-        print("\nFATAL ERROR:", repr(error))
+    asyncio.run(main())
