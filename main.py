@@ -1,5 +1,6 @@
 import asyncio
 import contextvars
+import logging
 import secrets
 import shutil
 import json
@@ -15,6 +16,9 @@ from pathlib import Path
 from telethon import TelegramClient, events, connection, Button
 from telethon.sessions import StringSession
 from cryptography.fernet import Fernet
+
+# خطاهای Handlerها در لاگ Railway دیده شوند
+logging.basicConfig(level=logging.WARNING)
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -29,18 +33,46 @@ from telethon.errors import (
 # 1. TELEGRAM ACCOUNT  (از Environment Variable خوانده می‌شود)
 # =========================================================
 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ["OWNER_ID"])  # آیدی عددی خودت
+def need(name):
+
+    """متغیر محیطی را می‌خواند؛ اگر نبود، فقط «اسم»‌های موجود را در لاگ چاپ می‌کند (نه مقدارها)."""
+
+    value = os.environ.get(name)
+
+    if value is None or not value.strip():
+
+        # تحمل اشتباه‌های کوچک مثل فاصله‌ی اضافه یا حروف کوچک در اسم متغیر
+        for key, item in os.environ.items():
+
+            if key.strip().upper() == name and item.strip():
+                return item.strip()
+
+        names = sorted(
+            key for key in os.environ
+            if not key.startswith("RAILWAY_")
+            and key not in ("PATH", "HOME", "HOSTNAME", "PWD", "LANG", "SHLVL", "_")
+        )
+
+        print(f"[ENV ERROR] متغیر {name} برای این سرویس پیدا نشد.")
+        print("[ENV ERROR] اسم متغیرهای دیده‌شده در این سرویس:", names)
+
+        raise SystemExit(f"متغیر {name} تنظیم نشده است.")
+
+    return value.strip()
+
+
+API_ID = int(need("API_ID"))
+API_HASH = need("API_HASH")
+BOT_TOKEN = need("BOT_TOKEN")
+OWNER_ID = int(need("OWNER_ID"))  # آیدی عددی خودت
 # یوزرنیم تو که در بخش «خرید سلف» به کاربر نشان داده می‌شود.
 # برای عوض کردنش فقط همین خط را ویرایش کن (با @ یا بدون @).
-OWNER_USERNAME = "@Arshia25a"
+OWNER_USERNAME = "@your_username"
 MAX_ACCOUNTS = int(os.environ.get("MAX_ACCOUNTS", "20"))
 
 # کلید رمزنگاری Sessionها. ساخت: python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"
 try:
-    FERNET = Fernet(os.environ["SESSION_KEY"].encode())
+    FERNET = Fernet(need("SESSION_KEY").encode())
 except Exception:
     raise SystemExit("SESSION_KEY تنظیم نشده یا نامعتبر است.")
 
@@ -3020,16 +3052,30 @@ def user_status_panel(user_id):
 # ADMIN / OWNER MENUS
 # ---------------------------------------------------------
 
-def admin_menu():
+def admin_menu(user_id=None):
 
     rows = [
         [Button.inline(f"📋 اکانت‌ها ({len(accounts_meta)}/{MAX_ACCOUNTS})", data=b"accs")],
         [Button.inline("🎟 ساخت کد ویژه", data=b"newcode")]
     ]
 
+    own_line = ""
+    own_id = find_user_account(user_id) if user_id else None
+
+    if own_id is not None:
+
+        own_meta = accounts_meta[own_id]
+
+        own_line = (
+            f"👤 اکانت تو وصل است: {own_meta.get('name', '?')}\n"
+            f"وضعیت سلف: {status_text(own_id)}\n"
+            f"مدت باقی‌مانده: {remaining_text(own_meta)}\n\n"
+        )
+
     text = (
         "🛡 پنل ادمین\n"
         "━━━━━━━━━━━━━━━━━━\n"
+        f"{own_line}"
         "می‌توانی سلف اکانت‌ها را خاموش/روشن کنی و کد ویژه بسازی."
     )
 
@@ -3081,7 +3127,7 @@ def menu_for(user_id):
         return owner_menu()
 
     if role == "admin":
-        return admin_menu()
+        return admin_menu(user_id)
 
     return user_menu(user_id)
 
@@ -3873,7 +3919,27 @@ async def bot_message_handler(event):
     flow = flows.get(user_id) or {}
     step = flow.get("step")
 
+    # فقط دستورهای /... در لاگ ثبت می‌شوند (شماره و کد ورود هرگز لاگ نمی‌شوند)
+    if text.startswith("/"):
+        print(f"[BOT CMD] from={user_id} role={role} cmd={text.split()[0][:20]}")
+
     # ---------- commands ----------
+
+    if text.lower() == "/id":
+
+        if user_id == OWNER_ID:
+            owner_note = "✅ تو مالک ربات هستی."
+        else:
+            owner_note = (
+                "⚠️ تو مالک نیستی؛ اگر باید باشی، این عدد را در "
+                "Variable به نام OWNER_ID بگذار و دوباره دیپلوی کن."
+            )
+
+        await event.respond(
+            f"🆔 آیدی عددی تو: {user_id}\n"
+            f"نقش: {role}\n{owner_note}"
+        )
+        return
 
     if text.lower() in ("/start", "/panel", "/menu"):
 
@@ -4200,6 +4266,9 @@ async def main():
     print("=" * 50)
 
     await bot.start(bot_token=BOT_TOKEN)
+
+    bot_me = await bot.get_me()
+    print("Bot: @" + str(bot_me.username))
 
     load_bot_state()
     load_accounts_meta()
