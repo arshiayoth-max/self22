@@ -88,7 +88,11 @@ if OWNER_USERNAME and not OWNER_USERNAME.startswith("@"):
     OWNER_USERNAME = "@" + OWNER_USERNAME
 
 # مسیر Volume در Railway
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+# اگر در Railway یک Volume وصل باشد، همیشه از مسیر خودِ آن استفاده می‌شود
+DATA_DIR = Path(
+    os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+    or os.environ.get("DATA_DIR", "/data")
+)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -131,6 +135,7 @@ class Account:
         self.battle_settings = {}
         self.battle_tasks = {}
         self.energy_tasks = {}
+        self.word_tasks = {}
         self.battle_settings_loaded = False
 
     @property
@@ -151,7 +156,7 @@ class Account:
 
     def stop_tasks(self):
 
-        for group in (self.tasks, self.battle_tasks, self.energy_tasks):
+        for group in (self.tasks, self.battle_tasks, self.energy_tasks, self.word_tasks):
 
             for task in list(group.values()):
 
@@ -222,6 +227,11 @@ DEFAULT_SETTINGS = {
     "energy": False,             # قابلیت «انرژی کافی نداری»
     "energy_delay": 20,          # دقیقه
     "energy_text": "انرژی 30",
+    "timer_on": True,            # تایمر: هر N دقیقه
+    "pre_on": False,             # قبل از ساعت (مثلاً X:59) فقط با شرط قیمت
+    "pre_minute": 59,
+    "w1_on": False, "w1_word": "", "w1_min": 300, "w1_max": 600,   # کلمه‌ی خودکار ۱
+    "w2_on": False, "w2_word": "", "w2_min": 300, "w2_max": 600,   # کلمه‌ی خودکار ۲
     "running": False,            # بعد از ری‌استارت/دیپلوی خودکار ادامه پیدا می‌کند
     "title": ""                  # اسم گروه (برای پنل)
 }
@@ -283,8 +293,14 @@ def get_settings(chat_id):
 
     else:
 
+        current = settings[key]
+
+        # مهاجرت: قبلاً «ساعتی» جایگزین تایمر بود؛ حالا مستقل‌اند
+        if "timer_on" not in current and current.get("hourly"):
+            current["timer_on"] = False
+
         for name, value in DEFAULT_SETTINGS.items():
-            settings[key].setdefault(name, value)
+            current.setdefault(name, value)
 
     return settings[key]
 
@@ -1035,7 +1051,7 @@ async def click_final_button(message):
 # 8. FACTORY CYCLE
 # =========================================================
 
-async def run_cycle(chat_id, test=False):
+async def run_cycle(chat_id, test=False, trigger="timer"):
 
     config = get_settings(chat_id)
 
@@ -1075,6 +1091,12 @@ async def run_cycle(chat_id, test=False):
         print("\n[2] WAREHOUSE")
 
         check_mode = config.get("check_mode", "both")
+
+        # قبل از ساعت (مثلاً X:59): به انبار کاری ندارد، فقط قیمت
+        if trigger == "pre":
+            check_mode = "price"
+
+        print("TRIGGER:", trigger, "| MODE:", check_mode)
         needs_warehouse = check_mode in ("both", "warehouse")
         needs_price = check_mode in ("both", "price")
 
@@ -1245,17 +1267,33 @@ async def automatic_loop(chat_id, skip_first=False):
         f"[AUTO] Started for group {chat_id}"
     )
 
-    if skip_first:
-        await wait_next_cycle(chat_id)
+    timer_base = time.time()
+    last_sale = 0.0
+
+    # اولین بررسی بلافاصله بعد از /GO؛ بعد از ری‌استارت صبر می‌کند تا زمان‌بندی برسد
+    trigger = None if skip_first else "first"
 
     while True:
 
+        if trigger is None:
+            trigger = await wait_for_trigger(chat_id, timer_base)
+
         try:
 
-            await run_cycle(
-                chat_id,
-                test=False
-            )
+            if trigger != "first" and time.time() - last_sale < 90:
+
+                print("[AUTO] Skipped (just sold):", trigger)
+
+            else:
+
+                done = await run_cycle(
+                    chat_id,
+                    test=False,
+                    trigger="timer" if trigger == "first" else trigger
+                )
+
+                if done:
+                    last_sale = time.time()
 
         except asyncio.CancelledError:
 
@@ -1282,42 +1320,10 @@ async def automatic_loop(chat_id, skip_first=False):
                 f"در تلاش بعدی دوباره بررسی می‌کنم."
             )
 
-        interval_event = get_interval_event(chat_id)
+        if trigger in ("first", "timer"):
+            timer_base = time.time()
 
-        while True:
-
-            interval_event.clear()
-
-            wait_config = get_settings(chat_id)
-
-            if wait_config.get("hourly"):
-
-                interval = seconds_until_next_hour(
-                    int(wait_config.get("hourly_minute", 0))
-                )
-
-            else:
-
-                interval = wait_config["interval"]
-
-            print(
-                f"[AUTO] Next cycle in {int(interval // 60)} minutes"
-            )
-
-            try:
-
-                await asyncio.wait_for(
-                    interval_event.wait(),
-                    timeout=interval
-                )
-
-                print(
-                    "[AUTO] Interval changed; restarting countdown"
-                )
-
-            except asyncio.TimeoutError:
-
-                break
+        trigger = None
 
 
 # =========================================================
@@ -1771,6 +1777,7 @@ async def command_handler(event):
 
             config["hourly"] = True
             config["hourly_minute"] = minute
+            config["timer_on"] = False
 
             save_settings()
 
@@ -1786,6 +1793,7 @@ async def command_handler(event):
         elif word in ("off", "0", "خاموش"):
 
             config["hourly"] = False
+            config["timer_on"] = True
 
             save_settings()
 
@@ -2163,6 +2171,14 @@ async def wait_for_battle_reply(
 
         text = message.raw_text or ""
 
+        # بازی گفته انرژی کافی نیست؛ این هم یک پاسخ معتبر است
+        if ENERGY_PHRASE in normalize_fa(text):
+
+            print("[BATTLE] Energy message detected")
+
+            future.set_result(message)
+            return
+
         percentage = get_battle_percentage(text)
 
         if percentage is None:
@@ -2300,6 +2316,10 @@ async def run_battle_cycle(
         timeout=90
     )
 
+    if ENERGY_PHRASE in normalize_fa(game_message.raw_text or ""):
+
+        return "ENERGY"
+
     percentage = get_battle_percentage(
         game_message.raw_text or ""
     )
@@ -2352,6 +2372,7 @@ async def automatic_battle_loop(
     print("[BATTLE] TARGET:", target_user_id)
 
     first_cycle = True
+    timeouts = 0
 
     try:
 
@@ -2367,11 +2388,40 @@ async def automatic_battle_loop(
 
             first_cycle = False
 
-            result = await run_battle_cycle(
-                chat_id,
-                target_user_id=target_user_id,
-                before_id=before_id
-            )
+            try:
+
+                result = await run_battle_cycle(
+                    chat_id,
+                    target_user_id=target_user_id,
+                    before_id=before_id
+                )
+
+                timeouts = 0
+
+            except asyncio.TimeoutError:
+
+                timeouts += 1
+
+                if timeouts >= 3:
+                    raise RuntimeError("بازی ۳ بار پشت‌سرهم جواب نداد.")
+
+                await send_report(
+                    chat_id,
+                    f"⏳ بازی جواب نداد ({timeouts}/3)؛ ۱ دقیقه بعد دوباره امتحان می‌کنم."
+                )
+
+                await asyncio.sleep(60)
+
+                continue
+
+            if result == "ENERGY":
+
+                # انرژی تمام شد: Auto Battle متوقف نمی‌شود؛ صبر می‌کند و بعد ادامه می‌دهد
+                await wait_for_energy(chat_id)
+
+                await asyncio.sleep(random.randint(5, 15))
+
+                continue
 
             if not result:
 
@@ -2679,28 +2729,69 @@ def seconds_until_next_hour(minute=0):
 
 def next_check_text(config):
 
+    parts = []
+
+    if config.get("timer_on", True):
+        parts.append(f"{config['interval'] // 60} دقیقه دیگر")
+
     if config.get("hourly"):
 
         target = next_hour_datetime(int(config.get("hourly_minute", 0)))
+        parts.append(f"ساعت {target.strftime('%H:%M')} به وقت ایران")
 
-        return f"ساعت {target.strftime('%H:%M')} به وقت ایران"
+    if config.get("pre_on"):
 
-    return f"{config['interval'] // 60} دقیقه دیگر"
+        target = next_hour_datetime(int(config.get("pre_minute", 59)))
+        parts.append(f"ساعت {target.strftime('%H:%M')} (فقط قیمت)")
+
+    return " یا ".join(parts) if parts else "هر وقت یک زمان‌بندی را روشن کنی"
 
 
 def schedule_text(config):
 
+    parts = []
+
+    if config.get("timer_on", True):
+        parts.append(f"تایمر هر {config['interval'] // 60} دقیقه")
+
+    if config.get("hourly"):
+        parts.append(f"هر ساعت دقیقه {int(config.get('hourly_minute', 0)):02d} (وقت ایران)")
+
+    if config.get("pre_on"):
+        parts.append(f"دقیقه {int(config.get('pre_minute', 59)):02d} هر ساعت (فقط قیمت)")
+
+    return " + ".join(parts) if parts else "هیچ زمان‌بندی روشن نیست"
+
+
+def trigger_candidates(config, timer_base):
+
+    """همه‌ی زمان‌بندی‌های روشن را با زمان بعدیشان (epoch) برمی‌گرداند."""
+
+    candidates = []
+
+    if config.get("timer_on", True):
+        candidates.append(("timer", timer_base + int(config["interval"])))
+
     if config.get("hourly"):
 
-        return (
-            f"هر ساعت، دقیقه {int(config.get('hourly_minute', 0)):02d} "
-            "(وقت ایران)"
-        )
+        candidates.append((
+            "hourly",
+            next_hour_datetime(int(config.get("hourly_minute", 0))).timestamp()
+        ))
 
-    return f"هر {config['interval'] // 60} دقیقه"
+    if config.get("pre_on"):
+
+        candidates.append((
+            "pre",
+            next_hour_datetime(int(config.get("pre_minute", 59))).timestamp()
+        ))
+
+    return candidates
 
 
-async def wait_next_cycle(chat_id):
+async def wait_for_trigger(chat_id, timer_base):
+
+    """تا نزدیک‌ترین زمان‌بندی روشن صبر می‌کند و اسمش را برمی‌گرداند."""
 
     interval_event = get_interval_event(chat_id)
 
@@ -2708,28 +2799,123 @@ async def wait_next_cycle(chat_id):
 
         interval_event.clear()
 
-        wait_config = get_settings(chat_id)
+        candidates = trigger_candidates(get_settings(chat_id), timer_base)
 
-        if wait_config.get("hourly"):
+        if not candidates:
 
-            interval = seconds_until_next_hour(
-                int(wait_config.get("hourly_minute", 0))
-            )
+            # هیچ زمان‌بندی‌ای روشن نیست؛ تا تغییر تنظیمات صبر می‌کند
+            await interval_event.wait()
+            continue
 
-        else:
+        name, when = min(candidates, key=lambda item: item[1])
 
-            interval = wait_config["interval"]
+        print(
+            f"[AUTO] Next: {name} in {int(max(0.0, when - time.time()) // 60)} minutes"
+        )
 
         try:
 
             await asyncio.wait_for(
                 interval_event.wait(),
-                timeout=interval
+                timeout=max(0.0, when - time.time())
             )
+
+            print("[AUTO] Settings changed; recalculating")
+
+            continue
 
         except asyncio.TimeoutError:
 
-            return
+            pass
+
+        # اگر چند میلی‌ثانیه زودتر بیدار شدیم، تا لحظه‌ی دقیق صبر کن
+        while time.time() < when:
+            await asyncio.sleep(0.05)
+
+        return name
+
+
+# ---------------------------------------------------------
+# کلمه‌های خودکار (دو تای مستقل، هرکدام با کلمه و تایمر خودش)
+# ---------------------------------------------------------
+
+def word_line(config, slot):
+
+    word = config.get(f"w{slot}_word") or "—"
+
+    low = int(config.get(f"w{slot}_min", 300))
+    high = int(config.get(f"w{slot}_max", 600))
+
+    span = (
+        f"{low / 60:g} دقیقه"
+        if high <= low
+        else f"{low / 60:g} تا {high / 60:g} دقیقه"
+    )
+
+    state = "روشن" if config.get(f"w{slot}_on") else "خاموش"
+
+    return f"{word} | هر {span} | {state}"
+
+
+async def word_loop(chat_id, slot):
+
+    print(f"[WORD] Started slot {slot} chat={chat_id}")
+
+    try:
+
+        while True:
+
+            config = get_settings(chat_id)
+
+            if not config.get(f"w{slot}_on"):
+                return
+
+            low = int(config.get(f"w{slot}_min", 300))
+            high = int(config.get(f"w{slot}_max", 600))
+
+            # ثانیه‌ی تصادفی هم حفظ می‌شود
+            delay = low if high <= low else random.randint(low, high)
+
+            await asyncio.sleep(delay)
+
+            config = get_settings(chat_id)
+
+            if not config.get(f"w{slot}_on"):
+                return
+
+            word = config.get(f"w{slot}_word")
+
+            if word and CUR.get().is_active():
+
+                try:
+
+                    await client.send_message(chat_id, word)
+
+                    print(f"[WORD] Sent slot {slot}:", word)
+
+                except asyncio.CancelledError:
+
+                    raise
+
+                except Exception as error:
+
+                    print("[WORD ERROR]", repr(error))
+
+    except asyncio.CancelledError:
+
+        print(f"[WORD] Stopped slot {slot} chat={chat_id}")
+        raise
+
+
+def start_word_loop(chat_id, slot):
+
+    account = CUR.get()
+    key = (chat_id, slot)
+
+    task = account.word_tasks.get(key)
+
+    if task is None or task.done():
+        account.word_tasks[key] = asyncio.create_task(word_loop(chat_id, slot))
 
 
 ENERGY_PHRASE = "انرژی کافی نداری"
@@ -2773,6 +2959,55 @@ async def energy_send_later(chat_id, delay_seconds, text):
         print("[ENERGY ERROR]", repr(error))
 
 
+def schedule_energy(chat_id):
+
+    """ارسال متن انرژی را بعد از تاخیر برنامه‌ریزی می‌کند. خروجی: (تسک، تازه ساخته شد؟)"""
+
+    account = CUR.get()
+    config = get_settings(chat_id)
+
+    existing = account.energy_tasks.get(chat_id)
+
+    if existing is not None and not existing.done():
+        return existing, False
+
+    delay_minutes = max(0, int(config.get("energy_delay", 20)))
+    text = config.get("energy_text", "انرژی 30")
+
+    task = asyncio.create_task(
+        energy_send_later(chat_id, delay_minutes * 60, text)
+    )
+
+    account.energy_tasks[chat_id] = task
+
+    return task, True
+
+
+async def wait_for_energy(chat_id):
+
+    """Auto Battle را تا ارسال متن انرژی (یا گذشتن تاخیر) نگه می‌دارد."""
+
+    config = get_settings(chat_id)
+
+    delay_minutes = max(0, int(config.get("energy_delay", 20)))
+
+    await send_report(
+        chat_id,
+        "🕹 انرژی کافی نبود؛ Auto Battle متوقف نشد.\n"
+        f"بعد از {delay_minutes} دقیقه ادامه می‌دهد."
+    )
+
+    if config.get("energy"):
+
+        task, _ = schedule_energy(chat_id)
+
+        await task
+
+        return
+
+    await asyncio.sleep(delay_minutes * 60)
+
+
 async def energy_watch_handler(event):
 
     if not event.is_group:
@@ -2798,19 +3033,13 @@ async def energy_watch_handler(event):
     if reply is None or not reply.out:
         return
 
-    account = CUR.get()
+    task, created = schedule_energy(chat_id)
 
-    existing = account.energy_tasks.get(chat_id)
-
-    if existing and not existing.done():
+    if not created:
         return
 
-    delay_minutes = max(0, int(config.get("energy_delay", 20)))
     text = config.get("energy_text", "انرژی 30")
-
-    account.energy_tasks[chat_id] = asyncio.create_task(
-        energy_send_later(chat_id, delay_minutes * 60, text)
-    )
+    delay_minutes = max(0, int(config.get("energy_delay", 20)))
 
     await send_report(
         chat_id,
@@ -3171,6 +3400,15 @@ def resume_account(account):
                     )
 
                     print(f"[RESUME] factory {account.id} chat={chat_id}")
+
+        for key, config in list(account.settings.items()):
+
+            if isinstance(config, dict):
+
+                for slot in (1, 2):
+
+                    if config.get(f"w{slot}_on"):
+                        start_word_loop(int(key), slot)
 
         for key, data in list(account.battle_settings.items()):
 
@@ -4168,7 +4406,12 @@ PANEL_PROMPTS = {
     "edelay": "⏳ تاخیر قابلیت انرژی را به دقیقه بفرست.",
     "etext": "✏️ متنی که بعد از «انرژی کافی نداری» ارسال شود را بفرست.",
     "bdelay": "🕹 زمان ریپلای را به دقیقه بفرست.\nمثال: 2 5 ← بین ۲ تا ۵ دقیقه | 2 ← دقیقاً ۲ دقیقه",
-    "bword": "💬 کلمه‌ی عملیات (Auto Battle) را بفرست."
+    "bword": "💬 کلمه‌ی عملیات (Auto Battle) را بفرست.",
+    "pminute": "🕘 دقیقه‌ی بررسی قبل از ساعت را بفرست (۰ تا ۵۹). مثلاً 59 یعنی ۵:۵۹ و ۶:۵۹ و ...",
+    "w1word": "✏️ کلمه‌ی ۱ را بفرست؛ همین متن داخل گروه نوشته می‌شود.",
+    "w2word": "✏️ کلمه‌ی ۲ را بفرست؛ همین متن داخل گروه نوشته می‌شود.",
+    "w1time": "⏱ زمان کلمه‌ی ۱ را به دقیقه بفرست.\nمثال: 5 10 ← هر بار بین ۵ تا ۱۰ دقیقه | 5 ← دقیقاً ۵ دقیقه",
+    "w2time": "⏱ زمان کلمه‌ی ۲ را به دقیقه بفرست.\nمثال: 5 10 ← هر بار بین ۵ تا ۱۰ دقیقه | 5 ← دقیقاً ۵ دقیقه"
 }
 
 
@@ -4277,6 +4520,8 @@ def group_panel(account_id, chat_key):
         f"⏰ زمان‌بندی: {schedule_text(config)}\n"
         f"⚡ انرژی: {'روشن' if config.get('energy') else 'خاموش'} "
         f"({config.get('energy_delay')} دقیقه ← «{config.get('energy_text')}»)\n"
+        f"🗣 کلمه ۱: {word_line(config, 1)}\n"
+        f"🗣 کلمه ۲: {word_line(config, 2)}\n"
         f"🕹 ریپلای: {delay_text} | کلمه: {battle.get('word') or '—'}"
     )
 
@@ -4291,22 +4536,41 @@ def group_panel(account_id, chat_key):
             key(f"💰 حداقل قیمت: {int(config.get('min_price', 0)):,}", "price")
         ],
         [key(f"📦 محصول: {config.get('product')}", "product")],
-        [key(f"⏰ {'ساعتی (وقت ایران)' if config.get('hourly') else 'فاصله‌ای'} ⟲", "hourly")],
     ]
 
-    if config.get("hourly"):
+    def dot(flag):
+        return "🟢" if flag else "⚪"
 
-        rows.append([key(f"🕐 دقیقه‌ی ساعت: {int(config.get('hourly_minute', 0)):02d}", "minute")])
+    rows.append([
+        key(f"⏱ تایمر {dot(config.get('timer_on', True))}", "timer"),
+        key(f"فاصله: {config.get('interval', 1800) // 60} دقیقه", "interval")
+    ])
 
-    else:
+    rows.append([
+        key(f"🕐 راس ساعت {dot(config.get('hourly'))}", "hourly"),
+        key(f"دقیقه: {int(config.get('hourly_minute', 0)):02d}", "minute")
+    ])
 
-        rows.append([key(f"⏱ فاصله: {config.get('interval', 1800) // 60} دقیقه", "interval")])
+    rows.append([
+        key(f"🕘 قبل ساعت، فقط قیمت {dot(config.get('pre_on'))}", "pre"),
+        key(f"دقیقه: {int(config.get('pre_minute', 59)):02d}", "pminute")
+    ])
 
     rows.append([
         key(f"⚡ انرژی: {'روشن' if config.get('energy') else 'خاموش'}", "energy"),
         key("⏳ تاخیر", "edelay"),
         key("✏️ متن", "etext")
     ])
+
+    for slot in (1, 2):
+
+        word_on = bool(config.get(f"w{slot}_on"))
+
+        rows.append([
+            key(f"{dot(word_on)} کلمه {slot}", f"w{slot}"),
+            key("✏️ کلمه", f"w{slot}word"),
+            key("⏱ زمان", f"w{slot}time")
+        ])
 
     rows.append([key("🕹 زمان ریپلای", "bdelay"), key("💬 کلمه عملیات", "bword")])
 
@@ -4343,7 +4607,7 @@ def apply_panel_input(account, chat_key, field, text):
 
             config["min_price" if field == "price" else "warehouse_capacity"] = value
 
-        elif field in ("interval", "minute", "edelay"):
+        elif field in ("interval", "minute", "pminute", "edelay"):
 
             numbers = re.findall(r"\d+", raw)
 
@@ -4360,12 +4624,12 @@ def apply_panel_input(account, chat_key, field, text):
                 config["interval"] = value * 60
                 get_interval_event(chat_id).set()
 
-            elif field == "minute":
+            elif field in ("minute", "pminute"):
 
                 if value > 59:
                     return False, "❌ عدد باید بین ۰ تا ۵۹ باشد."
 
-                config["hourly_minute"] = value
+                config["hourly_minute" if field == "minute" else "pre_minute"] = value
                 get_interval_event(chat_id).set()
 
             else:
@@ -4408,6 +4672,36 @@ def apply_panel_input(account, chat_key, field, text):
             set_battle_delay(chat_id, low, high)
 
             return True, "✅ ذخیره شد."
+
+        elif field in ("w1word", "w2word"):
+
+            value = (text or "").strip()
+
+            if not value:
+                return False, "❌ متن خالی است."
+
+            config[f"w{field[1]}_word"] = value
+
+        elif field in ("w1time", "w2time"):
+
+            numbers = re.findall(r"\d+(?:[.,٫]\d+)?", raw)
+
+            if not numbers:
+                return False, "❌ یک یا دو عدد بفرست؛ مثلاً: 5 10"
+
+            values = [
+                float(item.replace(",", ".").replace("٫", "."))
+                for item in numbers[:2]
+            ]
+
+            low = int(min(values) * 60)
+            high = int(max(values) * 60)
+
+            if low < 10:
+                return False, "❌ حداقل زمان ۱۰ ثانیه است."
+
+            config[f"w{field[1]}_min"] = low
+            config[f"w{field[1]}_max"] = high
 
         else:
 
@@ -4859,6 +5153,42 @@ async def dispatch_callback(event, user_id, action, argument):
 
                 config["energy"] = not config.get("energy", False)
                 save_settings()
+
+            elif op == "timer":
+
+                config["timer_on"] = not config.get("timer_on", True)
+                save_settings()
+                get_interval_event(chat_id).set()
+
+            elif op == "pre":
+
+                config["pre_on"] = not config.get("pre_on", False)
+                save_settings()
+                get_interval_event(chat_id).set()
+
+            elif op in ("w1", "w2"):
+
+                slot = int(op[1])
+
+                if not config.get(f"w{slot}_on"):
+
+                    if not config.get(f"w{slot}_word"):
+                        return "اول کلمه را تنظیم کن (✏️ کلمه)."
+
+                    config[f"w{slot}_on"] = True
+                    save_settings()
+
+                    start_word_loop(chat_id, slot)
+
+                else:
+
+                    config[f"w{slot}_on"] = False
+                    save_settings()
+
+                    word_task = account.word_tasks.get((chat_id, slot))
+
+                    if word_task is not None and not word_task.done():
+                        word_task.cancel()
 
         finally:
 
@@ -5741,6 +6071,26 @@ async def main():
 
     if broken:
         message += "\n\n⚠️ نیاز به ورود مجدد: " + "، ".join(broken)
+
+    on_railway = bool(
+        os.environ.get("RAILWAY_ENVIRONMENT")
+        or os.environ.get("RAILWAY_PROJECT_ID")
+    )
+
+    has_volume = (
+        bool(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH"))
+        or os.path.ismount(str(DATA_DIR))
+    )
+
+    print(f"[STORAGE] dir={DATA_DIR} volume={has_volume} accounts={len(accounts_meta)}")
+
+    if on_railway and not has_volume:
+
+        message += (
+            "\n\n🚨 Volume به این سرویس وصل نیست!\n"
+            "با هر دیپلوی همه‌ی اکانت‌ها و تنظیمات پاک می‌شوند. "
+            "در Railway یک Volume با Mount Path برابر /data بساز و وصل کن."
+        )
 
     await notify(OWNER_ID, message)
 
