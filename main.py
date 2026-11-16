@@ -154,6 +154,12 @@ class Account:
 
         return (not expires_at) or time.time() < expires_at
 
+    def feature(self, name):
+
+        """آیا این بخش از سلف برای این اکانت آزاد است؟ (مالک می‌تواند خاموشش کند)"""
+
+        return bool(self.meta.get("features", {}).get(name, True))
+
     def stop_tasks(self):
 
         for group in (self.tasks, self.battle_tasks, self.energy_tasks, self.word_tasks):
@@ -1267,6 +1273,9 @@ async def automatic_loop(chat_id, skip_first=False):
         f"[AUTO] Started for group {chat_id}"
     )
 
+    if not CUR.get().feature("factory"):
+        return
+
     timer_base = time.time()
     last_sale = 0.0
 
@@ -1403,6 +1412,11 @@ def schedule_command_delete(event):
 # 11. COMMAND HANDLER
 # =========================================================
 
+FACTORY_COMMANDS = {
+    "/START", "/STOP", "/TEST", "/STATUS", "/PRODUCT", "/PRICE",
+    "/CAPACITY", "/INTERVAL", "/PREDICT", "/MODE", "/HOURLY"
+}
+
 COMMAND_PATTERN = (
     r"(?i)^/(GO|OFF|TEST|INFO|P|MIN|CAP|TIME|PREDICT|HELP|START|STOP|STATUS|PRODUCT|PRICE|CAPACITY|INTERVAL|HOURLY|H|MODE|M|ENERGY|E|PANEL)(?:\s+.*)?$"
 )
@@ -1466,6 +1480,20 @@ async def command_handler(event):
     chat_id = event.chat_id
 
     schedule_command_delete(event)
+
+    needed_account = CUR.get()
+
+    if command in FACTORY_COMMANDS and not needed_account.feature("factory"):
+
+        await send_report(chat_id, "⛔ بخش کارخونه برای اکانت تو غیرفعال است (توسط مالک).")
+        return
+
+    if command == "/ENERGY" and not (
+        needed_account.feature("factory") or needed_account.feature("battle")
+    ):
+
+        await send_report(chat_id, "⛔ این بخش برای اکانت تو غیرفعال است (توسط مالک).")
+        return
 
     config = get_settings(chat_id)
 
@@ -2018,6 +2046,45 @@ def set_battle_word(chat_id, word):
     save_battle_settings()
 
 
+async def ensure_user_entity(chat_id, user_id):
+
+    """بعد از ری‌استارت، کش Telegram خالی است؛ شخص هدف را دوباره پیدا می‌کند."""
+
+    try:
+
+        await client.get_input_entity(user_id)
+        return
+
+    except Exception:
+
+        pass
+
+    info = battle_settings.get(str(chat_id), {}).get("info", {}).get(str(user_id), {})
+    username = info.get("username")
+
+    if username:
+
+        try:
+
+            await client.get_entity(username)
+            return
+
+        except Exception:
+
+            pass
+
+    try:
+
+        async for participant in client.iter_participants(chat_id, limit=5000):
+
+            if participant.id == user_id:
+                return
+
+    except Exception as error:
+
+        print("[ENSURE ENTITY ERROR]", repr(error))
+
+
 def get_battle_delay(chat_id):
 
     load_battle_settings()
@@ -2049,7 +2116,7 @@ def set_battle_delay(chat_id, low, high):
     save_battle_settings()
 
 
-def add_battle_target(chat_id, target_user_id):
+def add_battle_target(chat_id, target_user_id, name=None, username=None):
 
     load_battle_settings()
 
@@ -2062,6 +2129,11 @@ def add_battle_target(chat_id, target_user_id):
 
     if target_user_id not in targets:
         targets.append(target_user_id)
+
+    if name or username:
+
+        info = battle_settings[key].setdefault("info", {})
+        info[str(target_user_id)] = {"name": name or "", "username": username or ""}
 
     save_battle_settings()
 
@@ -2089,6 +2161,8 @@ async def get_last_account_message(
     target_user_id,
     before_id=None
 ):
+
+    await ensure_user_entity(chat_id, target_user_id)
 
     kwargs = {}
 
@@ -2371,6 +2445,9 @@ async def automatic_battle_loop(
     print("\n[BATTLE] AUTOMATIC SYSTEM STARTED")
     print("[BATTLE] TARGET:", target_user_id)
 
+    if not CUR.get().feature("battle"):
+        return
+
     first_cycle = True
     timeouts = 0
 
@@ -2496,6 +2573,11 @@ async def battle_command_handler(event):
     )
 
     chat_id = event.chat_id
+
+    if not CUR.get().feature("battle"):
+
+        await send_report(chat_id, "⛔ بخش ریپلای خودکار برای اکانت تو غیرفعال است (توسط مالک).")
+        return
 
     # -----------------------------------------------------
     # W - CHANGE WORD
@@ -2867,7 +2949,7 @@ async def word_loop(chat_id, slot):
 
             config = get_settings(chat_id)
 
-            if not config.get(f"w{slot}_on"):
+            if not config.get(f"w{slot}_on") or not CUR.get().feature("words"):
                 return
 
             low = int(config.get(f"w{slot}_min", 300))
@@ -3024,6 +3106,11 @@ async def energy_watch_handler(event):
     if not config.get("energy"):
         return
 
+    gate_account = CUR.get()
+
+    if not (gate_account.feature("factory") or gate_account.feature("battle")):
+        return
+
     if ENERGY_PHRASE not in normalize_fa(event.raw_text):
         return
 
@@ -3063,7 +3150,14 @@ def default_state():
         "global_off": False,
         "users": {},
         "codes": {},
-        "requests": {}
+        "requests": {},
+        "shop": {
+            "enabled": True,
+            "card": "",
+            "holder": "",
+            "plans": {},
+            "orders": {}
+        }
     }
 
 
@@ -3388,7 +3482,7 @@ def resume_account(account):
 
         for key, config in list(account.settings.items()):
 
-            if isinstance(config, dict) and config.get("running"):
+            if isinstance(config, dict) and config.get("running") and account.feature("factory"):
 
                 chat_id = int(key)
                 task = account.tasks.get(chat_id)
@@ -3407,12 +3501,12 @@ def resume_account(account):
 
                 for slot in (1, 2):
 
-                    if config.get(f"w{slot}_on"):
+                    if config.get(f"w{slot}_on") and account.feature("words"):
                         start_word_loop(int(key), slot)
 
         for key, data in list(account.battle_settings.items()):
 
-            if not isinstance(data, dict):
+            if not isinstance(data, dict) or not account.feature("battle"):
                 continue
 
             for target in list(data.get("targets", [])):
@@ -3818,7 +3912,7 @@ def user_menu(user_id):
     rows = [
         [Button.inline("🎁 اشتراک تست یک‌روزه", data=b"trial")],
         [Button.inline("🔑 استفاده از کد ویژه", data=b"usecode")],
-        [Button.inline("🛒 خرید سلف", data=b"buy")]
+        [Button.inline("🛒 خرید اشتراک", data=b"buy")]
     ]
 
     if find_user_account(user_id):
@@ -3897,7 +3991,7 @@ def admin_menu(user_id=None):
 
 def owner_menu():
 
-    pending = len(pending_requests())
+    pending = shop_pending_count()
 
     global_label = (
         "🟢 روشن کردن سلف روی همه"
@@ -3911,7 +4005,7 @@ def owner_menu():
             Button.inline("➕ افزودن اکانت من", data=b"addown")
         ],
         [
-            Button.inline(f"🛒 درخواست‌های خرید ({pending})", data=b"rqlist"),
+            Button.inline(f"🏪 فروشگاه ({pending})", data=b"shop"),
             Button.inline("🎟 ساخت کد ویژه", data=b"newcode")
         ],
         [
@@ -3932,7 +4026,7 @@ def owner_menu():
         "━━━━━━━━━━━━━━━━━━\n"
         f"سلف کلی: {'⛔ خاموش' if STATE.get('global_off') else '🟢 روشن'}\n"
         f"ظرفیت اکانت‌ها: {len(accounts_meta)}/{MAX_ACCOUNTS}\n"
-        f"درخواست خرید در انتظار: {pending}"
+        f"رسید در انتظار تایید: {pending}"
     )
 
     return text, rows
@@ -4032,6 +4126,17 @@ def account_panel(account_id, role):
             Button.inline("⏳ تنظیم مدت", data=f"days:{account_id}".encode()),
             Button.inline("➕ تمدید", data=f"ext:{account_id}".encode())
         ])
+
+        for feature_key, feature_label in FEATURES.items():
+
+            enabled = meta.get("features", {}).get(feature_key, True)
+
+            rows.append([
+                Button.inline(
+                    f"{'✅' if enabled else '⛔'} {feature_label}",
+                    data=f"ft:{feature_key}:{account_id}".encode()
+                )
+            ])
 
         rows.append([
             Button.inline("🗑 حذف اکانت", data=f"del:{account_id}".encode())
@@ -4332,52 +4437,166 @@ async def finish_login(event, user_id):
 # BUY
 # ---------------------------------------------------------
 
-async def handle_buy(event, user_id):
+def shop():
 
-    user = get_user(user_id)
+    data = STATE.setdefault("shop", {})
 
-    # خرید تأییدشده: سلف روی اکانت وصل (یا فعال) می‌شود
-    if int(user.get("entitled_days", 0)) > 0:
+    data.setdefault("enabled", True)
+    data.setdefault("card", "")
+    data.setdefault("holder", "")
+    data.setdefault("plans", {})
+    data.setdefault("orders", {})
 
-        await start_purpose(event, user_id, {"kind": "buy"})
-        return
+    return data
 
-    has_pending = any(
-        info["uid"] == user_id
-        for info in pending_requests().values()
+
+def new_numeric_id(mapping):
+
+    numbers = [int(key) for key in mapping if str(key).isdigit()]
+
+    return str(max(numbers, default=0) + 1)
+
+
+def shop_pending_count():
+
+    return sum(
+        1
+        for order in shop()["orders"].values()
+        if order.get("status") == "receipt"
     )
 
-    if not has_pending:
 
-        request_id = new_request_id()
+def money(value):
 
-        STATE["requests"][request_id] = {
-            "uid": user_id,
-            "time": int(time.time()),
-            "status": "pending",
-            "days": 0
-        }
+    return f"{int(value):,} تومان"
 
-        save_bot_state()
+
+def format_card(number):
+
+    digits = re.sub(r"\D", "", number or "")
+
+    return " ".join(digits[i:i + 4] for i in range(0, len(digits), 4))
+
+
+def find_open_order(user_id):
+
+    for order_id, order in shop()["orders"].items():
+
+        if order.get("uid") == user_id and order.get("status") == "awaiting_receipt":
+            return order_id
+
+    return None
+
+
+def shop_menu(user_id):
+
+    data = shop()
+
+    lines = ["🛒 خرید اشتراک", "━━━━━━━━━━━━━━━━━━"]
+    rows = []
+
+    if not data["enabled"]:
+
+        lines.append("فروشگاه فعلاً بسته است.")
+
+    elif not data["plans"]:
+
+        lines.append("هنوز اشتراکی تعریف نشده است.")
+
+    else:
+
+        lines.append("یکی از اشتراک‌ها را انتخاب کن:")
+
+        for plan_id, plan in data["plans"].items():
+
+            rows.append([
+                Button.inline(
+                    f"{plan['name']} • {plan['days']} روز • {money(plan['price'])}",
+                    data=f"plan:{plan_id}".encode()
+                )
+            ])
+
+    entitled = int(get_user(user_id).get("entitled_days", 0))
+
+    if entitled > 0:
+
+        rows.append([
+            Button.inline(
+                f"🔌 فعال‌سازی اشتراک خریداری‌شده ({entitled} روز)",
+                data=b"activate"
+            )
+        ])
+
+    open_order = find_open_order(user_id)
+
+    if open_order:
+
+        rows.append([
+            Button.inline(
+                f"📄 ارسال رسید سفارش #{open_order}",
+                data=f"porder:{open_order}".encode()
+            )
+        ])
+
+    rows.append(back_button())
+
+    return "\n".join(lines), rows
+
+
+async def handle_buy(event, user_id):
+
+    text, rows = shop_menu(user_id)
+
+    await show(event, text, rows)
+
+
+def payment_text(order):
+
+    data = shop()
+
+    return (
+        f"💳 پرداخت سفارش #{order['id']}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"اشتراک: {order['plan_name']} ({order['days']} روز)\n"
+        f"مبلغ: {money(order['price'])}\n\n"
+        f"شماره کارت:\n`{format_card(data['card'])}`\n"
+        + (f"به نام: {data['holder']}\n" if data.get("holder") else "")
+        + "\nبعد از واریز، «عکس رسید» یا «شماره پیگیری» را همین‌جا بفرست."
+    )
+
+
+async def grant_order(order):
+
+    """بعد از تایید مالک، اشتراک را برای خریدار فعال می‌کند."""
+
+    user_id = order["uid"]
+    days = int(order["days"])
+
+    existing = find_user_account(user_id)
+
+    if existing is not None and accounts[existing].authorized:
+
+        apply_grant(existing, days)
+
+        text, rows = user_status_panel(user_id)
 
         await notify(
-            OWNER_ID,
-            f"🛒 درخواست خرید جدید #{request_id}\n"
-            f"کاربر: {user_label(user_id)}\n"
-            f"آیدی عددی: {user_id}",
-            buttons=[[
-                Button.inline("✅ تایید و تعیین مدت", data=f"rq_ok:{request_id}".encode()),
-                Button.inline("❌ رد", data=f"rq_no:{request_id}".encode())
-            ]]
+            user_id,
+            f"✅ پرداختت تایید شد؛ اشتراک «{order['plan_name']}» ({days} روز) فعال شد.\n\n{text}",
+            buttons=rows
         )
 
-    contact = OWNER_USERNAME or "(آیدی مالک تنظیم نشده)"
+        return
 
-    await event.respond(
-        "🛒 برای خرید سلف به آیدی من پیام بده:\n"
-        f"{contact}\n\n"
-        "بعد از تایید خرید، دوباره همین دکمه (خرید سلف) را بزن تا سلف روی اکانتت وصل شود.",
-        buttons=[back_button()]
+    user = get_user(user_id)
+    user["entitled_days"] = int(user.get("entitled_days", 0)) + days
+    save_bot_state()
+
+    await notify(
+        user_id,
+        f"✅ پرداختت تایید شد؛ اشتراک «{order['plan_name']}» ({days} روز) برایت ثبت شد.\n"
+        "برای فعال‌شدن، اکانتت را وصل کن:",
+        buttons=[[Button.inline("🔌 اتصال اکانت و فعال‌سازی", data=b"activate")]]
     )
 
 
@@ -4388,6 +4607,27 @@ async def handle_buy(event, user_id):
 # ---------------------------------------------------------
 # پنل دکمه‌ای سلف (در پیوی ربات)
 # ---------------------------------------------------------
+
+FEATURES = {
+    "factory": "🏭 کارخونه",
+    "battle": "🕹 ریپلای خودکار",
+    "words": "🗣 کلمه خودکار"
+}
+
+PANEL_OP_FEATURES = {}
+
+for _op in ("go", "off", "mode", "cap", "price", "product", "timer", "hourly",
+            "pre", "interval", "minute", "pminute"):
+    PANEL_OP_FEATURES[_op] = ("factory",)
+
+for _op in ("w1", "w2", "w1word", "w1time", "w2word", "w2time"):
+    PANEL_OP_FEATURES[_op] = ("words",)
+
+for _op in ("bdelay", "bword", "btarget", "bx"):
+    PANEL_OP_FEATURES[_op] = ("battle",)
+
+for _op in ("energy", "edelay", "etext"):
+    PANEL_OP_FEATURES[_op] = ("factory", "battle")
 
 MODE_ORDER = ["both", "price", "warehouse"]
 
@@ -4408,6 +4648,7 @@ PANEL_PROMPTS = {
     "bdelay": "🕹 زمان ریپلای را به دقیقه بفرست.\nمثال: 2 5 ← بین ۲ تا ۵ دقیقه | 2 ← دقیقاً ۲ دقیقه",
     "bword": "💬 کلمه‌ی عملیات (Auto Battle) را بفرست.",
     "pminute": "🕘 دقیقه‌ی بررسی قبل از ساعت را بفرست (۰ تا ۵۹). مثلاً 59 یعنی ۵:۵۹ و ۶:۵۹ و ...",
+    "btarget": "⚔️ یوزرنیم (مثل @name) یا آیدی عددی شخص هدف را بفرست.\nسلف آخرین پیام او در همین گروه را ریپلای می‌کند.",
     "w1word": "✏️ کلمه‌ی ۱ را بفرست؛ همین متن داخل گروه نوشته می‌شود.",
     "w2word": "✏️ کلمه‌ی ۲ را بفرست؛ همین متن داخل گروه نوشته می‌شود.",
     "w1time": "⏱ زمان کلمه‌ی ۱ را به دقیقه بفرست.\nمثال: 5 10 ← هر بار بین ۵ تا ۱۰ دقیقه | 5 ← دقیقاً ۵ دقیقه",
@@ -4508,71 +4749,145 @@ def group_panel(account_id, chat_key):
 
     mode = config.get("check_mode", "both")
 
-    text = (
-        f"⚙️ {group_title(account, chat_key)}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"وضعیت سلف: {status_text(account_id)}\n"
-        f"مدیریت کارخانه: {'▶️ در حال اجرا' if running else '⏹ متوقف'}\n\n"
-        f"🎯 حالت بررسی: {MODE_SHORT.get(mode)}\n"
-        f"🏭 حداقل انبار: {config.get('warehouse_capacity')}\n"
-        f"💰 حداقل قیمت: {int(config.get('min_price', 0)):,}\n"
-        f"📦 محصول: {config.get('product')}\n"
-        f"⏰ زمان‌بندی: {schedule_text(config)}\n"
-        f"⚡ انرژی: {'روشن' if config.get('energy') else 'خاموش'} "
-        f"({config.get('energy_delay')} دقیقه ← «{config.get('energy_text')}»)\n"
-        f"🗣 کلمه ۱: {word_line(config, 1)}\n"
-        f"🗣 کلمه ۲: {word_line(config, 2)}\n"
-        f"🕹 ریپلای: {delay_text} | کلمه: {battle.get('word') or '—'}"
-    )
+    factory_on = account.feature("factory")
+    battle_on = account.feature("battle")
+    words_on = account.feature("words")
 
-    def key(label, op):
-        return Button.inline(label, data=f"spo:{op}:{account_id}:{chat_key}".encode())
+    lock = "🔒 غیرفعال (توسط مالک)"
 
-    rows = [
-        [key("▶️ شروع", "go"), key("⏹ توقف", "off")],
-        [key(f"🎯 حالت: {MODE_SHORT.get(mode)}", "mode")],
-        [
-            key(f"🏭 حداقل انبار: {config.get('warehouse_capacity')}", "cap"),
-            key(f"💰 حداقل قیمت: {int(config.get('min_price', 0)):,}", "price")
-        ],
-        [key(f"📦 محصول: {config.get('product')}", "product")],
+    lines = [
+        f"⚙️ {group_title(account, chat_key)}",
+        "━━━━━━━━━━━━━━━━━━",
+        f"وضعیت سلف: {status_text(account_id)}",
+        ""
     ]
+
+    if factory_on:
+
+        lines += [
+            f"🏭 کارخونه: {'▶️ در حال اجرا' if running else '⏹ متوقف'}",
+            f"🎯 حالت بررسی: {MODE_SHORT.get(mode)}",
+            f"🏭 حداقل انبار: {config.get('warehouse_capacity')}",
+            f"💰 حداقل قیمت: {int(config.get('min_price', 0)):,}",
+            f"📦 محصول: {config.get('product')}",
+            f"⏰ زمان‌بندی: {schedule_text(config)}"
+        ]
+
+    else:
+
+        lines.append(f"🏭 کارخونه: {lock}")
+
+    if factory_on or battle_on:
+
+        lines.append(
+            f"⚡ انرژی: {'روشن' if config.get('energy') else 'خاموش'} "
+            f"({config.get('energy_delay')} دقیقه ← «{config.get('energy_text')}»)"
+        )
+
+    if words_on:
+
+        lines.append(f"🗣 کلمه ۱: {word_line(config, 1)}")
+        lines.append(f"🗣 کلمه ۲: {word_line(config, 2)}")
+
+    else:
+
+        lines.append(f"🗣 کلمه خودکار: {lock}")
+
+    targets = list(battle.get("targets", []))
+    info = battle.get("info", {})
+
+    def target_name(target):
+        return info.get(str(target), {}).get("name") or str(target)
+
+    if battle_on:
+
+        lines.append(f"🕹 ریپلای: {delay_text} | کلمه: {battle.get('word') or '—'}")
+
+        if targets:
+
+            alive = []
+
+            for target in targets:
+
+                target_task = account.battle_tasks.get((chat_id, target))
+                state = "▶️" if target_task is not None and not target_task.done() else "⏸"
+                alive.append(f"{state} {target_name(target)}")
+
+            lines.append("⚔️ اهداف حمله: " + "، ".join(alive))
+
+        else:
+
+            lines.append("⚔️ اهداف حمله: —")
+
+    else:
+
+        lines.append(f"🕹 ریپلای خودکار: {lock}")
+
+    text = "\n".join(lines)
+
+    def key(label, op, extra=""):
+
+        data = f"spo:{op}:{account_id}:{chat_key}"
+
+        if extra:
+            data += f":{extra}"
+
+        return Button.inline(label, data=data.encode())
 
     def dot(flag):
         return "🟢" if flag else "⚪"
 
-    rows.append([
-        key(f"⏱ تایمر {dot(config.get('timer_on', True))}", "timer"),
-        key(f"فاصله: {config.get('interval', 1800) // 60} دقیقه", "interval")
-    ])
+    rows = []
 
-    rows.append([
-        key(f"🕐 راس ساعت {dot(config.get('hourly'))}", "hourly"),
-        key(f"دقیقه: {int(config.get('hourly_minute', 0)):02d}", "minute")
-    ])
+    if factory_on:
 
-    rows.append([
-        key(f"🕘 قبل ساعت، فقط قیمت {dot(config.get('pre_on'))}", "pre"),
-        key(f"دقیقه: {int(config.get('pre_minute', 59)):02d}", "pminute")
-    ])
+        rows += [
+            [key("▶️ شروع", "go"), key("⏹ توقف", "off")],
+            [key(f"🎯 حالت: {MODE_SHORT.get(mode)}", "mode")],
+            [
+                key(f"🏭 حداقل انبار: {config.get('warehouse_capacity')}", "cap"),
+                key(f"💰 حداقل قیمت: {int(config.get('min_price', 0)):,}", "price")
+            ],
+            [key(f"📦 محصول: {config.get('product')}", "product")],
+            [
+                key(f"⏱ تایمر {dot(config.get('timer_on', True))}", "timer"),
+                key(f"فاصله: {config.get('interval', 1800) // 60} دقیقه", "interval")
+            ],
+            [
+                key(f"🕐 راس ساعت {dot(config.get('hourly'))}", "hourly"),
+                key(f"دقیقه: {int(config.get('hourly_minute', 0)):02d}", "minute")
+            ],
+            [
+                key(f"🕘 قبل ساعت، فقط قیمت {dot(config.get('pre_on'))}", "pre"),
+                key(f"دقیقه: {int(config.get('pre_minute', 59)):02d}", "pminute")
+            ]
+        ]
 
-    rows.append([
-        key(f"⚡ انرژی: {'روشن' if config.get('energy') else 'خاموش'}", "energy"),
-        key("⏳ تاخیر", "edelay"),
-        key("✏️ متن", "etext")
-    ])
-
-    for slot in (1, 2):
-
-        word_on = bool(config.get(f"w{slot}_on"))
+    if factory_on or battle_on:
 
         rows.append([
-            key(f"{dot(word_on)} کلمه {slot}", f"w{slot}"),
-            key("✏️ کلمه", f"w{slot}word"),
-            key("⏱ زمان", f"w{slot}time")
+            key(f"⚡ انرژی: {'روشن' if config.get('energy') else 'خاموش'}", "energy"),
+            key("⏳ تاخیر", "edelay"),
+            key("✏️ متن", "etext")
         ])
 
-    rows.append([key("🕹 زمان ریپلای", "bdelay"), key("💬 کلمه عملیات", "bword")])
+    if words_on:
+
+        for slot in (1, 2):
+
+            rows.append([
+                key(f"{dot(bool(config.get(f'w{slot}_on')))} کلمه {slot}", f"w{slot}"),
+                key("✏️ کلمه", f"w{slot}word"),
+                key("⏱ زمان", f"w{slot}time")
+            ])
+
+    if battle_on:
+
+        rows.append([key("🕹 زمان ریپلای", "bdelay"), key("💬 کلمه عملیات", "bword")])
+        rows.append([key("⚔️ افزودن هدف (یوزرنیم/آیدی)", "btarget")])
+
+        for target in targets[:6]:
+            rows.append([key(f"⏹ توقف: {target_name(target)}", "bx", extra=str(target))])
 
     rows.append([
         key("🔄 به‌روزرسانی", "refresh"),
@@ -4580,6 +4895,59 @@ def group_panel(account_id, chat_key):
     ])
 
     return text, rows
+
+
+async def resolve_battle_target(account, chat_id, value):
+
+    """یوزرنیم یا آیدی عددی را به (آیدی، نام، یوزرنیم) تبدیل می‌کند."""
+
+    value = (value or "").strip()
+    digits = normalize_digits(value).strip()
+
+    entity = None
+
+    try:
+
+        if re.fullmatch(r"\d+", digits):
+
+            user_id = int(digits)
+
+            try:
+
+                entity = await account.client.get_entity(user_id)
+
+            except Exception:
+
+                async for participant in account.client.iter_participants(chat_id, limit=5000):
+
+                    if participant.id == user_id:
+                        entity = participant
+                        break
+
+        else:
+
+            username = value.replace("https://t.me/", "").replace("t.me/", "").lstrip("@").strip("/")
+
+            if not username:
+                return None
+
+            entity = await account.client.get_entity(username)
+
+    except Exception as error:
+
+        print("[RESOLVE TARGET ERROR]", repr(error))
+        return None
+
+    if entity is None or not hasattr(entity, "id"):
+        return None
+
+    name = " ".join(
+        part
+        for part in (getattr(entity, "first_name", None), getattr(entity, "last_name", None))
+        if part
+    ) or getattr(entity, "username", None) or str(entity.id)
+
+    return entity.id, name, getattr(entity, "username", None)
 
 
 def apply_panel_input(account, chat_key, field, text):
@@ -4714,6 +5082,170 @@ def apply_panel_input(account, chat_key, field, text):
     finally:
 
         CUR.reset(token)
+
+
+def shop_admin_panel():
+
+    data = shop()
+
+    text = (
+        "🏪 مدیریت فروشگاه\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"وضعیت: {'🟢 باز' if data['enabled'] else '🔴 بسته'}\n"
+        f"شماره کارت: {format_card(data['card']) or '—'}"
+        + (f" ({data['holder']})" if data.get("holder") else "")
+        + f"\nتعداد اشتراک‌ها: {len(data['plans'])}\n"
+        f"رسید در انتظار تایید: {shop_pending_count()}"
+    )
+
+    rows = [
+        [Button.inline(
+            "🔴 بستن فروشگاه" if data["enabled"] else "🟢 باز کردن فروشگاه",
+            data=b"shoptog"
+        )],
+        [Button.inline("💳 شماره کارت", data=b"shopcard")],
+        [Button.inline(f"📦 اشتراک‌ها ({len(data['plans'])})", data=b"plans")],
+        [Button.inline(f"🧾 رسیدها و سفارش‌ها ({shop_pending_count()})", data=b"orders")],
+        back_button()
+    ]
+
+    return text, rows
+
+
+def plans_panel():
+
+    data = shop()
+
+    lines = ["📦 اشتراک‌ها", "━━━━━━━━━━━━━━━━━━"]
+
+    if not data["plans"]:
+        lines.append("هنوز اشتراکی نساخته‌ای.")
+
+    rows = []
+
+    for plan_id, plan in data["plans"].items():
+
+        rows.append([
+            Button.inline(
+                f"{plan['name']} • {plan['days']} روز • {money(plan['price'])}",
+                data=f"pl:{plan_id}".encode()
+            )
+        ])
+
+    rows.append([Button.inline("➕ افزودن اشتراک", data=b"pladd")])
+    rows.append(back_button(b"shop"))
+
+    return "\n".join(lines), rows
+
+
+def plan_panel(plan_id):
+
+    plan = shop()["plans"].get(plan_id)
+
+    if plan is None:
+        return plans_panel()
+
+    text = (
+        f"📦 {plan['name']}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ مدت: {plan['days']} روز\n"
+        f"💰 قیمت: {money(plan['price'])}\n\n"
+        f"📝 توضیحات:\n{plan.get('desc') or '—'}"
+    )
+
+    def key(label, field):
+        return Button.inline(label, data=f"ple:{field}:{plan_id}".encode())
+
+    rows = [
+        [key("✏️ اسم", "name"), key("⏳ مدت", "days")],
+        [key("💰 قیمت", "price"), key("📝 توضیحات", "desc")],
+        [Button.inline("🗑 حذف اشتراک", data=f"pldel:{plan_id}".encode())],
+        back_button(b"plans")
+    ]
+
+    return text, rows
+
+
+def orders_panel():
+
+    orders = shop()["orders"]
+
+    waiting = [
+        (order_id, order)
+        for order_id, order in orders.items()
+        if order.get("status") == "receipt"
+    ]
+
+    lines = ["🧾 رسیدها و سفارش‌ها", "━━━━━━━━━━━━━━━━━━"]
+
+    if not waiting:
+        lines.append("رسیدی در انتظار تایید نیست.")
+
+    rows = []
+
+    for order_id, order in waiting:
+
+        rows.append([
+            Button.inline(
+                f"#{order_id} • {user_label(order['uid'])} • {order['plan_name']}",
+                data=f"so:{order_id}".encode()
+            )
+        ])
+
+    recent = list(orders.items())[-5:]
+
+    if recent:
+
+        lines.append("\nآخرین سفارش‌ها:")
+
+        labels = {
+            "awaiting_receipt": "⏳ منتظر رسید",
+            "receipt": "🧾 رسید رسیده",
+            "approved": "✅ تایید شد",
+            "rejected": "❌ رد شد",
+            "canceled": "🚫 لغو شد"
+        }
+
+        for order_id, order in reversed(recent):
+            lines.append(
+                f"#{order_id} • {user_label(order['uid'])} • {order['plan_name']} • "
+                f"{labels.get(order.get('status'), order.get('status'))}"
+            )
+
+    rows.append(back_button(b"shop"))
+
+    return "\n".join(lines), rows
+
+
+def order_panel(order_id):
+
+    order = shop()["orders"].get(order_id)
+
+    if order is None:
+        return orders_panel()
+
+    text = (
+        f"🧾 سفارش #{order_id}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"کاربر: {user_label(order['uid'])}\n"
+        f"آیدی عددی: {order['uid']}\n"
+        f"اشتراک: {order['plan_name']} ({order['days']} روز)\n"
+        f"مبلغ: {money(order['price'])}\n"
+        f"وضعیت: {order.get('status')}"
+    )
+
+    rows = []
+
+    if order.get("status") in ("receipt", "awaiting_receipt"):
+
+        rows.append([
+            Button.inline("✅ تایید و فعال‌سازی", data=f"so_ok:{order_id}".encode()),
+            Button.inline("❌ رد", data=f"so_no:{order_id}".encode())
+        ])
+
+    rows.append(back_button(b"orders"))
+
+    return text, rows
 
 
 BACKGROUND_TASKS = set()
@@ -5028,6 +5560,128 @@ async def dispatch_callback(event, user_id, action, argument):
         )
         return None
 
+    if action == "plan":
+
+        data = shop()
+        plan = data["plans"].get(argument)
+
+        if not data["enabled"]:
+            return "فروشگاه فعلاً بسته است."
+
+        if plan is None:
+            return "این اشتراک دیگر وجود ندارد."
+
+        text = (
+            f"📦 {plan['name']}\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"⏳ مدت: {plan['days']} روز\n"
+            f"💰 قیمت: {money(plan['price'])}\n\n"
+            f"{plan.get('desc') or '—'}"
+        )
+
+        await show(
+            event,
+            text,
+            [
+                [
+                    Button.inline("✅ تایید خرید", data=f"pbuy:{argument}".encode()),
+                    Button.inline("❌ انصراف", data=b"buy")
+                ]
+            ]
+        )
+        return None
+
+    if action == "pbuy":
+
+        data = shop()
+        plan = data["plans"].get(argument)
+
+        if not data["enabled"]:
+            return "فروشگاه فعلاً بسته است."
+
+        if plan is None:
+            return "این اشتراک دیگر وجود ندارد."
+
+        if not data.get("card"):
+            return "شماره کارت هنوز تنظیم نشده؛ به مالک پیام بده."
+
+        # سفارش باز قبلی همین کاربر لغو می‌شود
+        for old in data["orders"].values():
+
+            if old.get("uid") == user_id and old.get("status") == "awaiting_receipt":
+                old["status"] = "canceled"
+
+        order_id = new_numeric_id(data["orders"])
+
+        order = {
+            "id": order_id,
+            "uid": user_id,
+            "plan_id": argument,
+            "plan_name": plan["name"],
+            "days": int(plan["days"]),
+            "price": int(plan["price"]),
+            "status": "awaiting_receipt",
+            "created": int(time.time())
+        }
+
+        data["orders"][order_id] = order
+        save_bot_state()
+
+        await notify(
+            OWNER_ID,
+            f"🛍 سفارش جدید #{order_id}\n"
+            f"کاربر: {user_label(user_id)}\n"
+            f"اشتراک: {plan['name']} ({plan['days']} روز) • {money(plan['price'])}\n"
+            "منتظر واریز و ارسال رسید است."
+        )
+
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "receipt", "order_id": order_id}
+
+        await show(
+            event,
+            payment_text(order),
+            [[Button.inline("❌ لغو سفارش", data=f"pcancel:{order_id}".encode())]]
+        )
+        return None
+
+    if action == "pcancel":
+
+        order = shop()["orders"].get(argument)
+
+        if order is not None and order.get("uid") == user_id and order.get("status") == "awaiting_receipt":
+
+            order["status"] = "canceled"
+            save_bot_state()
+
+        await clear_flow(user_id)
+
+        text, rows = shop_menu(user_id)
+        await show(event, text, rows)
+        return None
+
+    if action == "porder":
+
+        order = shop()["orders"].get(argument)
+
+        if order is None or order.get("uid") != user_id or order.get("status") != "awaiting_receipt":
+            return "این سفارش دیگر در انتظار رسید نیست."
+
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "receipt", "order_id": argument}
+
+        await show(
+            event,
+            payment_text(order),
+            [[Button.inline("❌ لغو سفارش", data=f"pcancel:{argument}".encode())]]
+        )
+        return None
+
+    if action == "activate":
+
+        await start_purpose(event, user_id, {"kind": "buy"})
+        return None
+
     if action == "spm":
 
         owned = accounts_of(user_id)
@@ -5079,10 +5733,17 @@ async def dispatch_callback(event, user_id, action, argument):
         op, _, rest = argument.partition(":")
         account_id, _, chat_key = rest.partition(":")
 
+        chat_key, _, extra = chat_key.partition(":")
+
         account = owned_account(user_id, account_id)
 
         if account is None:
             return "این اکانت مال تو نیست یا وجود ندارد."
+
+        needed = PANEL_OP_FEATURES.get(op)
+
+        if needed and not any(account.feature(item) for item in needed):
+            return "⛔ این بخش توسط مالک برای اکانت تو غیرفعال شده است."
 
         if chat_key not in account.settings:
             return "این گروه دیگر وجود ندارد."
@@ -5153,6 +5814,19 @@ async def dispatch_callback(event, user_id, action, argument):
 
                 config["energy"] = not config.get("energy", False)
                 save_settings()
+
+            elif op == "bx":
+
+                if extra.lstrip("-").isdigit():
+
+                    target = int(extra)
+
+                    battle_task = account.battle_tasks.get((chat_id, target))
+
+                    if battle_task is not None and not battle_task.done():
+                        battle_task.cancel()
+
+                    remove_battle_target(chat_id, target)
 
             elif op == "timer":
 
@@ -5398,6 +6072,200 @@ async def dispatch_callback(event, user_id, action, argument):
     if action == "addown":
 
         await start_purpose(event, user_id, {"kind": "owner"})
+        return None
+
+    if action == "shop":
+
+        text, rows = shop_admin_panel()
+        await show(event, text, rows)
+        return None
+
+    if action == "shoptog":
+
+        shop()["enabled"] = not shop()["enabled"]
+        save_bot_state()
+
+        text, rows = shop_admin_panel()
+        await show(event, text, rows)
+        return None
+
+    if action == "shopcard":
+
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "shopcard"}
+
+        await event.respond(
+            "💳 شماره کارت را بفرست (۱۶ رقم). اگر خواستی، نام صاحب کارت را بعدش بنویس.\n"
+            "مثال: 6037 9918 1234 5678 علی رضایی\n\nبرای لغو: /cancel"
+        )
+        return None
+
+    if action == "plans":
+
+        text, rows = plans_panel()
+        await show(event, text, rows)
+        return None
+
+    if action == "pl":
+
+        text, rows = plan_panel(argument)
+        await show(event, text, rows)
+        return None
+
+    if action == "pladd":
+
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "pladd", "stage": "name", "draft": {}}
+
+        await event.respond(
+            "➕ اشتراک جدید\n\n1️⃣ اسم اشتراک را بفرست. مثال: اشتراک پلاس\n\nبرای لغو: /cancel"
+        )
+        return None
+
+    if action == "ple":
+
+        field, _, plan_id = argument.partition(":")
+
+        if plan_id not in shop()["plans"]:
+            return "این اشتراک وجود ندارد."
+
+        prompts = {
+            "name": "✏️ اسم جدید اشتراک را بفرست.",
+            "days": "⏳ مدت اشتراک را به روز بفرست (عدد).",
+            "price": "💰 قیمت را به تومان بفرست (عدد).",
+            "desc": "📝 توضیحات اشتراک را بفرست؛ همین متن به خریدار نشان داده می‌شود."
+        }
+
+        if field not in prompts:
+            return None
+
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "plset", "plan_id": plan_id, "field": field}
+
+        await event.respond(prompts[field] + "\n\nبرای لغو: /cancel")
+        return None
+
+    if action == "pldel":
+
+        plan = shop()["plans"].get(argument)
+
+        if plan is None:
+            return "این اشتراک وجود ندارد."
+
+        await show(
+            event,
+            f"🗑 اشتراک «{plan['name']}» حذف شود؟",
+            [
+                [Button.inline("✅ بله، حذف کن", data=f"pldelok:{argument}".encode())],
+                [Button.inline("⬅️ نه", data=f"pl:{argument}".encode())]
+            ]
+        )
+        return None
+
+    if action == "pldelok":
+
+        shop()["plans"].pop(argument, None)
+        save_bot_state()
+
+        text, rows = plans_panel()
+        await show(event, text, rows)
+        return None
+
+    if action == "orders":
+
+        text, rows = orders_panel()
+        await show(event, text, rows)
+        return None
+
+    if action == "so":
+
+        text, rows = order_panel(argument)
+        await show(event, text, rows)
+        return None
+
+    if action in ("so_ok", "so_no"):
+
+        order = shop()["orders"].get(argument)
+
+        if order is None or order.get("status") not in ("receipt", "awaiting_receipt"):
+            return "این سفارش دیگر در انتظار تایید نیست."
+
+        if action == "so_ok":
+
+            order["status"] = "approved"
+            order["approved_at"] = int(time.time())
+            save_bot_state()
+
+            await grant_order(order)
+
+            note = f"✅ سفارش #{argument} تایید و برای خریدار فعال/ثبت شد."
+
+        else:
+
+            order["status"] = "rejected"
+            save_bot_state()
+
+            await notify(
+                order["uid"],
+                f"❌ رسید سفارش #{argument} تایید نشد. اگر اشتباه شده، به مالک پیام بده "
+                f"({OWNER_USERNAME or 'پشتیبانی'}) یا دوباره از «خرید اشتراک» اقدام کن."
+            )
+
+            note = f"❌ سفارش #{argument} رد شد."
+
+        text, rows = orders_panel()
+        await show(event, f"{note}\n\n{text}", rows)
+        return None
+
+    if action == "ft":
+
+        feature, _, account_id = argument.partition(":")
+
+        meta = accounts_meta.get(account_id)
+
+        if meta is None or feature not in FEATURES:
+            return "این مورد وجود ندارد."
+
+        features = meta.setdefault("features", {})
+        features[feature] = not features.get(feature, True)
+
+        save_accounts_meta()
+
+        account = accounts.get(account_id)
+
+        if account is not None:
+
+            if not features[feature]:
+
+                groups = {
+                    "factory": [account.tasks],
+                    "battle": [account.battle_tasks],
+                    "words": [account.word_tasks]
+                }[feature]
+
+                for group in groups:
+
+                    for item in list(group.values()):
+
+                        if not item.done():
+                            item.cancel()
+
+            else:
+
+                resume_account(account)
+
+        holder = meta.get("bot_user")
+
+        if meta.get("kind") == "user" and holder:
+
+            await notify(
+                holder,
+                f"{'🔓 بخش' if features[feature] else '🔒 بخش'} «{FEATURES[feature]}» "
+                f"برای اکانت تو {'فعال شد' if features[feature] else 'غیرفعال شد'}."
+            )
+
+        text, rows = account_panel(account_id, "owner")
+        await show(event, text, rows)
         return None
 
     if action == "backup":
@@ -5791,6 +6659,188 @@ async def bot_message_handler(event):
         )
         return
 
+    # ---------- رسید پرداخت ----------
+
+    if step == "receipt":
+
+        order = shop()["orders"].get(flow.get("order_id"))
+
+        if order is None or order.get("status") != "awaiting_receipt":
+
+            await clear_flow(user_id)
+            await event.respond("این سفارش دیگر در انتظار رسید نیست. /start")
+            return
+
+        if not text and event.message.media is None:
+
+            await event.respond("❌ عکس رسید یا شماره پیگیری را بفرست.")
+            return
+
+        order["status"] = "receipt"
+        order["receipt_time"] = int(time.time())
+        save_bot_state()
+
+        await clear_flow(user_id)
+
+        try:
+
+            await bot.forward_messages(OWNER_ID, event.message)
+
+        except Exception:
+
+            try:
+                await bot.send_message(OWNER_ID, event.message)
+            except Exception as error:
+                print("[RECEIPT FORWARD ERROR]", repr(error))
+
+        await notify(
+            OWNER_ID,
+            f"🧾 رسید جدید — سفارش #{order['id']}\n"
+            f"کاربر: {user_label(user_id)}\n"
+            f"آیدی عددی: {user_id}\n"
+            f"اشتراک: {order['plan_name']} ({order['days']} روز)\n"
+            f"مبلغ: {money(order['price'])}",
+            buttons=[[
+                Button.inline("✅ تایید و فعال‌سازی", data=f"so_ok:{order['id']}".encode()),
+                Button.inline("❌ رد", data=f"so_no:{order['id']}".encode())
+            ]]
+        )
+
+        await event.respond(
+            "✅ رسیدت برای مالک ارسال شد. بعد از تایید، اشتراک فعال می‌شود و خبرت می‌کنم.",
+            buttons=[back_button()]
+        )
+        return
+
+    # ---------- تنظیمات فروشگاه (مالک) ----------
+
+    if role == "owner" and step == "shopcard":
+
+        match = re.search(r"(\d[\d\s-]{13,}\d)", normalize_digits(text))
+
+        digits = re.sub(r"\D", "", match.group(1)) if match else ""
+
+        if len(digits) < 16:
+
+            await event.respond("❌ شماره کارت ۱۶ رقمی را بفرست (اختیاری: نام صاحب کارت بعدش).")
+            return
+
+        holder = normalize_digits(text).replace(match.group(1), "").strip(" -:،")
+
+        shop()["card"] = digits
+        shop()["holder"] = holder
+
+        save_bot_state()
+        await clear_flow(user_id)
+
+        panel_text, rows = shop_admin_panel()
+        await event.respond(f"✅ ذخیره شد.\n\n{panel_text}", buttons=rows)
+        return
+
+    if role == "owner" and step == "pladd":
+
+        stage = flow.get("stage")
+        draft = flow.setdefault("draft", {})
+
+        if stage == "name":
+
+            if not text:
+                await event.respond("❌ اسم را بفرست.")
+                return
+
+            draft["name"] = text
+            flow["stage"] = "days"
+
+            await event.respond("2️⃣ مدت اشتراک را به روز بفرست (عدد). مثال: 7")
+            return
+
+        if stage == "days":
+
+            numbers = re.findall(r"\d+", normalize_digits(text))
+
+            if not numbers or int(numbers[0]) <= 0:
+                await event.respond("❌ یک عدد بزرگ‌تر از صفر بفرست.")
+                return
+
+            draft["days"] = int(numbers[0])
+            flow["stage"] = "price"
+
+            await event.respond("3️⃣ قیمت را به تومان بفرست (عدد). مثال: 150000")
+            return
+
+        if stage == "price":
+
+            try:
+                value = clean_number(text)
+            except ValueError:
+                await event.respond("❌ فقط یک عدد بفرست.")
+                return
+
+            draft["price"] = value
+            flow["stage"] = "desc"
+
+            await event.respond(
+                "4️⃣ توضیحات اشتراک را بفرست (همین متن به خریدار نشان داده می‌شود).\n"
+                "اگر توضیحی نمی‌خواهی، یک «-» بفرست."
+            )
+            return
+
+        if stage == "desc":
+
+            draft["desc"] = "" if text.strip() == "-" else text
+
+            plan_id = new_numeric_id(shop()["plans"])
+            shop()["plans"][plan_id] = dict(draft)
+
+            save_bot_state()
+            await clear_flow(user_id)
+
+            panel_text, rows = plan_panel(plan_id)
+            await event.respond(f"✅ اشتراک ساخته شد.\n\n{panel_text}", buttons=rows)
+            return
+
+    if role == "owner" and step == "plset":
+
+        plan = shop()["plans"].get(flow.get("plan_id"))
+        field = flow.get("field")
+
+        if plan is None:
+
+            await clear_flow(user_id)
+            await event.respond("این اشتراک دیگر وجود ندارد.")
+            return
+
+        if field in ("days", "price"):
+
+            try:
+                value = clean_number(text)
+            except ValueError:
+                await event.respond("❌ فقط یک عدد بفرست.")
+                return
+
+            if field == "days" and value <= 0:
+                await event.respond("❌ مدت باید بزرگ‌تر از صفر باشد.")
+                return
+
+            plan[field] = value
+
+        else:
+
+            if not text:
+                await event.respond("❌ متن خالی است.")
+                return
+
+            plan[field] = text
+
+        save_bot_state()
+
+        plan_id = flow["plan_id"]
+        await clear_flow(user_id)
+
+        panel_text, rows = plan_panel(plan_id)
+        await event.respond(f"✅ ذخیره شد.\n\n{panel_text}", buttons=rows)
+        return
+
     # ---------- مقدار تایپ‌شده در پنل سلف ----------
 
     if step == "pset":
@@ -5801,6 +6851,72 @@ async def bot_message_handler(event):
 
             await clear_flow(user_id)
             await event.respond("این اکانت دیگر وجود ندارد. /start")
+            return
+
+        needed = PANEL_OP_FEATURES.get(flow["field"])
+
+        if needed and not any(account.feature(item) for item in needed):
+
+            await clear_flow(user_id)
+            await event.respond("⛔ این بخش توسط مالک برای اکانت تو غیرفعال شده است.")
+            return
+
+        if flow["field"] == "btarget":
+
+            chat_key = flow["chat_key"]
+            chat_id = int(chat_key)
+
+            token = CUR.set(account)
+
+            try:
+                has_word = bool(get_battle_word(chat_id))
+            finally:
+                CUR.reset(token)
+
+            if not has_word:
+
+                await event.respond("❌ اول «💬 کلمه عملیات» را تنظیم کن.")
+                return
+
+            found = await resolve_battle_target(account, chat_id, text)
+
+            if found is None:
+
+                await event.respond(
+                    "❌ این شخص پیدا نشد. یوزرنیم یا آیدی عددی درست بفرست "
+                    "(شخص باید در همین گروه باشد)."
+                )
+                return
+
+            target_id, target_name_text, target_username = found
+
+            token = CUR.set(account)
+
+            try:
+
+                add_battle_target(chat_id, target_id, target_name_text, target_username)
+
+                battle_task = account.battle_tasks.get((chat_id, target_id))
+
+                if battle_task is None or battle_task.done():
+
+                    account.battle_tasks[(chat_id, target_id)] = asyncio.create_task(
+                        automatic_battle_loop(chat_id, None, target_id)
+                    )
+
+            finally:
+
+                CUR.reset(token)
+
+            account_id = flow["account_id"]
+            await clear_flow(user_id)
+
+            panel_text, rows = group_panel(account_id, chat_key)
+
+            await event.respond(
+                f"✅ حمله خودکار روی «{target_name_text}» شروع شد.\n\n{panel_text}",
+                buttons=rows
+            )
             return
 
         ok, message = apply_panel_input(
@@ -5978,7 +7094,7 @@ async def bot_message_handler(event):
             info["uid"],
             f"✅ خرید تو تایید شد ({value} روز).\n"
             "از /start دکمه «خرید سلف» را بزن تا سلف روی اکانتت وصل شود.",
-            buttons=[[Button.inline("🛒 خرید سلف", data=b"buy")]]
+            buttons=[[Button.inline("🛒 خرید اشتراک", data=b"buy")]]
         )
 
         await event.respond(
