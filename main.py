@@ -69,7 +69,7 @@ BOT_TOKEN = need("BOT_TOKEN")
 OWNER_ID = int(need("OWNER_ID"))  # آیدی عددی خودت
 # یوزرنیم تو که در بخش «خرید سلف» به کاربر نشان داده می‌شود.
 # برای عوض کردنش فقط همین خط را ویرایش کن (با @ یا بدون @).
-OWNER_USERNAME = "@your_username"
+OWNER_USERNAME = "@Arshia25a"
 MAX_ACCOUNTS = int(os.environ.get("MAX_ACCOUNTS", "20"))
 
 # کلید رمزنگاری Sessionها. ساخت: python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"
