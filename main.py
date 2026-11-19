@@ -3150,6 +3150,8 @@ def default_state():
         "global_off": False,
         "users": {},
         "codes": {},
+        "invite_codes": {},
+        "invites": {},
         "requests": {},
         "shop": {
             "enabled": True,
@@ -3286,10 +3288,17 @@ def get_user(user_id):
             "username": "",
             "trial_used": False,
             "entitled_days": 0,
-            "joined": int(time.time())
+            "joined": int(time.time()),
+            "invite_used": False,
+            "invite_last_created": 0,
+            "invite_code": None
         }
 
-    return STATE["users"][key]
+    user = STATE["users"][key]
+    user.setdefault("invite_used", False)
+    user.setdefault("invite_last_created", 0)
+    user.setdefault("invite_code", None)
+    return user
 
 
 async def touch_user(event):
@@ -3323,6 +3332,272 @@ def user_label(user_id):
     username = user.get("username")
 
     return f"{name} (@{username})" if username else f"{name} [{user_id}]"
+
+
+def invite_store():
+
+    STATE.setdefault("invite_codes", {})
+    STATE.setdefault("invites", {})
+    return STATE["invite_codes"], STATE["invites"]
+
+
+INVITE_CREATE_INTERVAL = 14 * 86400
+INVITE_MAX_USES = 3
+INVITE_INVITER_DAYS = 2
+INVITE_JOINER_DAYS = 1
+INVITE_ACTIVITY_WINDOW = 7 * 86400
+
+
+def create_user_invite_code(user_id):
+
+    codes, _ = invite_store()
+    user = get_user(user_id)
+    now = int(time.time())
+    last_created = int(user.get("invite_last_created", 0) or 0)
+
+    if last_created and now - last_created < INVITE_CREATE_INTERVAL:
+        current = user.get("invite_code")
+        if current and current in codes:
+            return current, max(0, INVITE_CREATE_INTERVAL - (now - last_created))
+        return None, max(0, INVITE_CREATE_INTERVAL - (now - last_created))
+
+    code = make_code()
+    while code in codes or code in STATE.get("codes", {}):
+        code = make_code()
+
+    codes[code] = {
+        "owner": int(user_id),
+        "created": now,
+        "uses": 0,
+        "used_by": []
+    }
+    user["invite_last_created"] = now
+    user["invite_code"] = code
+    save_bot_state()
+    return code, 0
+
+
+def validate_invite_code(user_id, raw_code):
+
+    codes, _ = invite_store()
+    code = normalize_code(raw_code)
+    found = next((key for key in codes if normalize_code(key) == code), None)
+    if not found:
+        return None, "❌ این کد دعوت معتبر نیست."
+
+    info = codes[found]
+    inviter = int(info.get("owner", 0))
+    used_by = info.setdefault("used_by", [])
+
+    if inviter == int(user_id):
+        return None, "❌ نمی‌توانی کد دعوت خودت را وارد کنی."
+    if get_user(user_id).get("invite_used"):
+        return None, "❌ قبلاً از سیستم دعوت استفاده کرده‌ای."
+    if int(info.get("uses", len(used_by))) >= INVITE_MAX_USES:
+        return None, "❌ ظرفیت استفاده از این کد تکمیل شده است."
+    if int(user_id) in [int(x) for x in used_by]:
+        return None, "❌ این کد را قبلاً وارد کرده‌ای."
+
+    return found, None
+
+
+def add_days_to_user_or_account(user_id, days, preferred_account_id=None):
+
+    """Award days to an authorized account, or keep them as activatable credit."""
+    days = int(days)
+    if days <= 0:
+        return
+
+    account_id = preferred_account_id or find_user_account(user_id)
+    if account_id and account_id in accounts_meta:
+        account = accounts.get(account_id)
+        if account is not None and account.authorized:
+            apply_grant(account_id, days)
+            return
+
+    user = get_user(user_id)
+    user["entitled_days"] = int(user.get("entitled_days", 0)) + days
+    save_bot_state()
+
+
+async def complete_invitation(invitee_id, invite_code, invitee_account_id):
+
+    """Consume a referral once, then award both parties after account connection."""
+    codes, invites = invite_store()
+    code_key, error = validate_invite_code(invitee_id, invite_code)
+    if error:
+        raise ValueError(error)
+
+    info = codes[code_key]
+    inviter_id = int(info["owner"])
+    invitee_id = int(invitee_id)
+    invite_id = new_numeric_id(invites)
+    now = int(time.time())
+
+    info.setdefault("used_by", []).append(invitee_id)
+    info["uses"] = len(info["used_by"])
+    info["last_used"] = now
+
+    inviter_days = INVITE_INVITER_DAYS
+    invitee_days = INVITE_JOINER_DAYS
+
+    # Award the invitee on the newly connected account.
+    add_days_to_user_or_account(invitee_id, invitee_days, invitee_account_id)
+    # The inviter may not yet have an active session; preserve the reward as credit.
+    add_days_to_user_or_account(inviter_id, inviter_days)
+
+    invites[invite_id] = {
+        "id": invite_id,
+        "code": code_key,
+        "inviter_id": inviter_id,
+        "invitee_id": invitee_id,
+        "invitee_account_id": invitee_account_id,
+        "created": now,
+        "connected_at": now,
+        "inviter_bonus_days": inviter_days,
+        "invitee_bonus_days": invitee_days,
+        "last_activity_at": 0,
+        "active": False,
+        "inactivity_reported": False
+    }
+
+    get_user(invitee_id)["invite_used"] = True
+    save_bot_state()
+
+    await notify(
+        inviter_id,
+        f"🎉 دعوتت با موفقیت ثبت شد!\nکاربر: {user_label(invitee_id)}\n"
+        f"🎁 {inviter_days} روز اشتراک اضافه شد.\n"
+        f"تعداد استفاده از کدت: {info['uses']}/{INVITE_MAX_USES}"
+    )
+    await notify(
+        invitee_id,
+        f"✅ کد دعوت پذیرفته شد و سلف متصل شد.\n🎁 {invitee_days} روز اشتراک اضافه دریافت کردی."
+    )
+    await notify(
+        OWNER_ID,
+        f"🆕 دعوت جدید ثبت شد (#{invite_id})\n"
+        f"دعوت‌کننده: {user_label(inviter_id)} [{inviter_id}]\n"
+        f"دعوت‌شونده: {user_label(invitee_id)} [{invitee_id}]\n"
+        f"کد: {code_key}\nوضعیت فعالیت: در انتظار استفاده واقعی از سلف"
+    )
+
+
+def record_invite_activity(account, event):
+
+    """Only a successful outgoing group command from the invited self counts."""
+    try:
+        if not event.is_group or not event.out:
+            return
+        command = (event.raw_text or "").strip().split(maxsplit=1)
+        if not command or command[0].upper() not in ("/GO", "/START", "/TEST", "/N"):
+            return
+        holder = int(account.meta.get("bot_user", 0) or 0)
+        if not holder:
+            return
+        _, invites = invite_store()
+        now = int(time.time())
+        changed = False
+        for invite in invites.values():
+            if int(invite.get("invitee_id", 0)) != holder:
+                continue
+            if invite.get("active"):
+                continue
+            invite["active"] = True
+            invite["last_activity_at"] = now
+            invite["activity_chat_id"] = int(event.chat_id)
+            invite["activity_command"] = (event.raw_text or "").split()[0][:32]
+            changed = True
+            break
+        if changed:
+            save_bot_state()
+            print(f"[INVITE] verified activity from user={holder}")
+    except Exception as error:
+        print("[INVITE ACTIVITY ERROR]", repr(error))
+
+
+def invite_user_panel(user_id):
+
+    user = get_user(user_id)
+    codes, invites = invite_store()
+    code = user.get("invite_code")
+    info = codes.get(code) if code else None
+    last_created = int(user.get("invite_last_created", 0) or 0)
+    remaining = max(0, INVITE_CREATE_INTERVAL - (int(time.time()) - last_created)) if last_created else 0
+    used = int(info.get("uses", 0)) if info else 0
+    successful = sum(1 for item in invites.values() if int(item.get("inviter_id", 0)) == int(user_id))
+
+    lines = [
+        "🎟 دعوت کاربران",
+        "━━━━━━━━━━━━━━━━━━",
+        f"استفاده از کدهای تو: {used}/{INVITE_MAX_USES}",
+        f"دعوت‌های ثبت‌شده: {successful}",
+        "جایزه دعوت‌کننده: ۲ روز | دعوت‌شونده: ۱ روز",
+        ""
+    ]
+    rows = []
+    if info and remaining > 0:
+        lines.append(f"کد فعلی تو: `{code}`")
+        lines.append(f"امکان ساخت کد جدید تا: {math.ceil(remaining / 86400)} روز دیگر")
+        rows.append([Button.inline("📋 نمایش کد دعوت من", data=b"invshow")])
+    elif info and used < INVITE_MAX_USES:
+        lines.append(f"کد فعلی تو: `{code}`")
+        rows.append([Button.inline("📋 نمایش کد دعوت من", data=b"invshow")])
+        rows.append([Button.inline("♻️ ساخت کد جدید", data=b"invmake")])
+    else:
+        lines.append("هنوز کد فعالی نداری یا ظرفیت کد قبلی تکمیل شده است.")
+        rows.append([Button.inline("➕ ساخت کد دعوت", data=b"invmake")])
+
+    rows.append([Button.inline("✍️ وارد کردن کد دعوت", data=b"inventer")])
+    rows.append(back_button())
+    return "\n".join(lines), rows
+
+
+def owner_invites_panel():
+
+    _, invites = invite_store()
+    items = list(invites.values())[-15:]
+    lines = ["👥 کاربران دعوت‌شده", "━━━━━━━━━━━━━━━━━━"]
+    rows = []
+    if not items:
+        lines.append("هنوز دعوتی ثبت نشده است.")
+    for item in reversed(items):
+        state = "🟢 فعال" if item.get("active") else "🟡 در انتظار فعالیت"
+        lines.append(
+            f"#{item['id']} | {user_label(item['invitee_id'])}\n"
+            f"دعوت‌کننده: {user_label(item['inviter_id'])}\nوضعیت: {state}"
+        )
+        rows.append([Button.inline(
+            f"🔎 جزئیات دعوت #{item['id']}",
+            data=f"invdet:{item['id']}".encode()
+        )])
+    rows.append(back_button())
+    return "\n".join(lines), rows
+
+
+def owner_invite_detail(invite_id):
+
+    _, invites = invite_store()
+    item = invites.get(str(invite_id))
+    if not item:
+        return "این دعوت پیدا نشد.", [back_button(b"invlist")]
+    active = bool(item.get("active"))
+    text = (
+        f"👥 جزئیات دعوت #{invite_id}\n━━━━━━━━━━━━━━━━━━\n"
+        f"دعوت‌کننده: {user_label(item['inviter_id'])} [{item['inviter_id']}]\n"
+        f"دعوت‌شونده: {user_label(item['invitee_id'])} [{item['invitee_id']}]\n"
+        f"کد: {item.get('code', '—')}\n"
+        f"وضعیت: {'🟢 فعال؛ دستور سلف اجرا شده' if active else '🟡 هنوز فعالیت واقعی ثبت نشده'}\n"
+        f"جایزه دعوت‌کننده: {item.get('inviter_bonus_days', INVITE_INVITER_DAYS)} روز\n"
+        f"جایزه دعوت‌شونده: {item.get('invitee_bonus_days', INVITE_JOINER_DAYS)} روز\n"
+        f"تاریخ ثبت: {datetime.fromtimestamp(int(item.get('created', 0))).strftime('%Y-%m-%d %H:%M')}"
+    )
+    rows = [
+        [Button.inline("✏️ تغییر جایزه دعوت‌کننده", data=f"invedit:{invite_id}:inviter".encode())],
+        [Button.inline("✏️ تغییر جایزه دعوت‌شونده", data=f"invedit:{invite_id}:invitee".encode())],
+        [Button.inline("⬅️ بازگشت به دعوت‌ها", data=b"invlist")]
+    ]
+    return text, rows
 
 
 def find_user_account(user_id):
@@ -3566,9 +3841,9 @@ def bind(account, handler):
                 return
 
             await handler(event)
+            record_invite_activity(account, event)
 
         finally:
-
             CUR.reset(token)
 
     return wrapper
@@ -3716,6 +3991,25 @@ async def expiry_watcher():
 
             now = time.time()
 
+            # دعوت‌هایی که تا ۷ روز پس از اتصال هیچ دستور گروهی واقعی اجرا نکرده‌اند، گزارش می‌شوند.
+            _, invite_records = invite_store()
+            for invite in invite_records.values():
+                if invite.get("active") or invite.get("inactivity_reported"):
+                    continue
+                connected_at = int(invite.get("connected_at", invite.get("created", now)))
+                if now - connected_at >= INVITE_ACTIVITY_WINDOW:
+                    invite["inactivity_reported"] = True
+                    save_bot_state()
+                    report = (
+                        f"⚠️ دعوت مشکوک؛ فعالیت ثبت نشده (#{invite.get('id')})\n"
+                        f"دعوت‌کننده: {user_label(invite.get('inviter_id'))} [{invite.get('inviter_id')}]\n"
+                        f"دعوت‌شونده: {user_label(invite.get('invitee_id'))} [{invite.get('invitee_id')}]\n"
+                        "تا ۷ روز پس از اتصال، هیچ دستور گروهی از سلف دعوت‌شونده ثبت نشده است."
+                    )
+                    await notify(OWNER_ID, report)
+                    for admin_id in list(STATE.get("admins", [])):
+                        await notify(int(admin_id), report)
+
             for account_id, meta in list(accounts_meta.items()):
 
                 expires_at = meta.get("expires_at")
@@ -3812,6 +4106,12 @@ def validate_purpose(user_id, purpose):
             return None, "❌ خرید تأییدشده‌ای برای تو ثبت نشده است."
 
         return days, None
+
+    if kind == "invite":
+        _, error = validate_invite_code(user_id, purpose.get("code", ""))
+        if error:
+            return None, error
+        return 0, None
 
     return None, "❌ درخواست نامعتبر است."
 
@@ -3912,7 +4212,8 @@ def user_menu(user_id):
     rows = [
         [Button.inline("🎁 اشتراک تست یک‌روزه", data=b"trial")],
         [Button.inline("🔑 استفاده از کد ویژه", data=b"usecode")],
-        [Button.inline("🛒 خرید اشتراک", data=b"buy")]
+        [Button.inline("🛒 خرید اشتراک", data=b"buy")],
+        [Button.inline("🎟 دعوت کاربران", data=b"invmenu")]
     ]
 
     if find_user_account(user_id):
@@ -4018,6 +4319,7 @@ def owner_menu():
         ],
         [Button.inline("♻️ بازیابی از پشتیبان", data=b"restore")],
         [Button.inline("⚙️ پنل سلف من", data=b"spm")],
+        [Button.inline("👥 کاربران دعوت‌شده", data=b"invlist")],
         [Button.inline(global_label, data=b"gtog")]
     ]
 
@@ -4292,13 +4594,18 @@ async def start_purpose(event, user_id, purpose):
 
             if accounts[existing].authorized:
 
-                commit_purpose(user_id, purpose)
-                apply_grant(existing, days)
+                if purpose.get("kind") == "invite":
+                    await complete_invitation(user_id, purpose.get("code", ""), existing)
+                else:
+                    commit_purpose(user_id, purpose)
+                    if days:
+                        apply_grant(existing, days)
 
                 text, rows = user_status_panel(user_id)
 
+                shown_days = INVITE_JOINER_DAYS if purpose.get("kind") == "invite" else days
                 await event.respond(
-                    f"✅ سلف روی اکانت قبلی‌ات فعال شد ({days} روز).\n\n{text}",
+                    f"✅ سلف روی اکانت قبلی‌ات فعال شد ({shown_days} روز).\n\n{text}",
                     buttons=rows
                 )
 
@@ -4416,20 +4723,25 @@ async def finish_login(event, user_id):
 
         return
 
-    commit_purpose(user_id, purpose)
-    apply_grant(account_id, days)
+    if purpose.get("kind") == "invite":
+        await complete_invitation(user_id, purpose.get("code", ""), account_id)
+    else:
+        commit_purpose(user_id, purpose)
+        if days:
+            apply_grant(account_id, days)
 
     text, rows = user_status_panel(user_id)
 
+    shown_days = INVITE_JOINER_DAYS if purpose.get("kind") == "invite" else days
     await event.respond(
-        f"✅ سلف روی اکانتت وصل و فعال شد ({days} روز).\n\n{text}",
+        f"✅ سلف روی اکانتت وصل و فعال شد ({shown_days} روز).\n\n{text}",
         buttons=rows
     )
 
     await notify(
         OWNER_ID,
         f"👤 {user_label(user_id)} سلف را وصل کرد.\n"
-        f"نوع: {purpose['kind']} • مدت: {days} روز"
+        f"نوع: {purpose['kind']} • مدت: {shown_days} روز"
     )
 
 
@@ -5534,6 +5846,41 @@ async def dispatch_callback(event, user_id, action, argument):
         )
         return None
 
+    if action == "invmenu":
+
+        text, rows = invite_user_panel(user_id)
+        await show(event, text, rows)
+        return None
+
+    if action == "invshow":
+
+        user = get_user(user_id)
+        code = user.get("invite_code")
+        if not code or code not in invite_store()[0]:
+            return "هنوز کد دعوتی نداری."
+        await show(
+            event,
+            f"🎟 کد دعوت تو\\n━━━━━━━━━━━━━━━━━━\\n`{code}`\\n\\nاین کد حداکثر ۳ بار قابل استفاده است.",
+            [[Button.inline("⬅️ بازگشت", data=b"invmenu")]]
+        )
+        return None
+
+    if action == "invmake":
+
+        code, wait_seconds = create_user_invite_code(user_id)
+        if code is None:
+            return f"⏳ برای ساخت کد جدید باید {math.ceil(wait_seconds / 86400)} روز دیگر صبر کنی."
+        text, rows = invite_user_panel(user_id)
+        await show(event, f"✅ کد دعوت ساخته شد:\\n`{code}`\\n\\n{text}", rows)
+        return None
+
+    if action == "inventer":
+
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "invite_code"}
+        await event.respond("✍️ کد دعوت را بفرست.\\nبرای لغو: /cancel")
+        return None
+
     if action == "buy":
 
         await handle_buy(event, user_id)
@@ -6069,6 +6416,43 @@ async def dispatch_callback(event, user_id, action, argument):
     if not is_owner:
         return "⛔ این بخش فقط برای مالک است."
 
+    if action == "invlist":
+
+        if not is_owner:
+            return "⛔ این بخش فقط برای مالک است."
+        text, rows = owner_invites_panel()
+        await show(event, text, rows)
+        return None
+
+    if action == "invdet":
+
+        if not is_owner:
+            return "⛔ این بخش فقط برای مالک است."
+        text, rows = owner_invite_detail(argument)
+        await show(event, text, rows)
+        return None
+
+    if action == "invedit":
+
+        if not is_owner:
+            return "⛔ این بخش فقط برای مالک است."
+        invite_id, _, target = argument.partition(":")
+        if invite_id not in invite_store()[1] or target not in ("inviter", "invitee"):
+            return "اطلاعات دعوت معتبر نیست."
+        await clear_flow(user_id)
+        flows[user_id] = {
+            "step": "invite_days",
+            "invite_id": invite_id,
+            "target": target
+        }
+        target_label = "دعوت‌کننده" if target == "inviter" else "دعوت‌شونده"
+        await event.respond(
+            f"⏳ مدت جایزه {target_label} را به روز بفرست.\\n"
+            "عدد جدید را وارد کن؛ اختلاف آن با جایزه قبلی روی زمان اشتراک اعمال می‌شود.\\n"
+            "برای لغو: /cancel"
+        )
+        return None
+
     if action == "addown":
 
         await start_purpose(event, user_id, {"kind": "owner"})
@@ -6523,6 +6907,116 @@ async def bot_message_handler(event):
 
         await clear_flow(user_id)
         await event.respond("لغو شد. برای منو: /start")
+        return
+
+    # ---------- سیستم دعوت کاربران ----------
+
+    if step == "invite_code":
+
+        code_key, error = validate_invite_code(user_id, text)
+        if error:
+            await event.respond(error + "\\nکد دیگری بفرست یا /cancel را بزن.")
+            return
+
+        a = random.randint(2, 9)
+        b = random.randint(1, 9)
+        flows[user_id] = {
+            "step": "invite_captcha",
+            "code": code_key,
+            "answer": str(a + b),
+            "attempts": 0
+        }
+        await event.respond(
+            f"🧩 برای تأیید انسان بودن، حاصل {a} + {b} را بفرست.\\n"
+            "این بررسی ساده جلوی ربات‌های خودکار را می‌گیرد."
+        )
+        return
+
+    if step == "invite_captcha":
+
+        if normalize_digits(text).strip() != flow.get("answer"):
+            flow["attempts"] = int(flow.get("attempts", 0)) + 1
+            if flow["attempts"] >= 3:
+                await clear_flow(user_id)
+                await event.respond("❌ آزمون ناموفق بود؛ دوباره از بخش دعوت کاربران شروع کن.")
+            else:
+                await event.respond("❌ پاسخ درست نیست؛ دوباره تلاش کن.")
+            return
+
+        code_key = flow.get("code")
+        await clear_flow(user_id)
+        await start_purpose(event, user_id, {"kind": "invite", "code": code_key})
+        return
+
+    if step == "invite_days" and role == "owner":
+
+        try:
+            new_days = clean_number(text)
+        except ValueError:
+            await event.respond("❌ تعداد روز را فقط به‌صورت عدد بفرست.")
+            return
+        if new_days < 0 or new_days > 3650:
+            await event.respond("❌ مقدار باید بین ۰ تا ۳۶۵۰ روز باشد.")
+            return
+
+        invite = invite_store()[1].get(str(flow.get("invite_id")))
+        if invite is None:
+            await clear_flow(user_id)
+            await event.respond("این دعوت دیگر وجود ندارد.")
+            return
+
+        target = flow.get("target")
+        field = "inviter_bonus_days" if target == "inviter" else "invitee_bonus_days"
+        previous = int(invite.get(field, 0))
+        delta = new_days - previous
+        target_user = int(invite["inviter_id"] if target == "inviter" else invite["invitee_id"])
+        target_account = None
+        if target == "invitee":
+            target_account = invite.get("invitee_account_id")
+        else:
+            target_account = find_user_account(target_user)
+
+        if delta:
+            if target_account and target_account in accounts_meta:
+                meta = accounts_meta[target_account]
+                expires = meta.get("expires_at")
+                if expires:
+                    now_ts = time.time()
+                    if expires > now_ts:
+                        updated = int(expires + delta * 86400)
+                    elif delta > 0:
+                        updated = int(now_ts + delta * 86400)
+                    else:
+                        updated = int(now_ts)
+                    meta["expires_at"] = updated
+                    if updated <= now_ts:
+                        meta["enabled"] = False
+                        account_obj = accounts.get(target_account)
+                        if account_obj:
+                            account_obj.stop_tasks()
+                    else:
+                        meta["enabled"] = True
+                        account_obj = accounts.get(target_account)
+                        if account_obj:
+                            resume_account(account_obj)
+                    save_accounts_meta()
+                else:
+                    # Unlimited or not-yet-activated account: preserve the difference as credit.
+                    u = get_user(target_user)
+                    u["entitled_days"] = max(0, int(u.get("entitled_days", 0)) + delta)
+                    save_bot_state()
+            else:
+                u = get_user(target_user)
+                u["entitled_days"] = max(0, int(u.get("entitled_days", 0)) + delta)
+                save_bot_state()
+
+        invite[field] = new_days
+        save_bot_state()
+        invite_id = str(invite["id"])
+        await clear_flow(user_id)
+        detail, rows = owner_invite_detail(invite_id)
+        await event.respond(f"✅ جایزه به‌روزرسانی شد.\\n\\n{detail}", buttons=rows)
+        await notify(target_user, f"ℹ️ مدت جایزه دعوت تو توسط مالک به {new_days} روز تغییر کرد.")
         return
 
     # ---------- کد ویژه ----------
