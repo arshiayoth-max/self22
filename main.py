@@ -12,6 +12,7 @@ import re
 import random
 import time
 import math
+import mimetypes
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -237,7 +238,9 @@ DEFAULT_SETTINGS = {
     "pre_on": False,             # قبل از ساعت (مثلاً X:59) فقط با شرط قیمت
     "pre_minute": 59,
     "w1_on": False, "w1_word": "", "w1_min": 300, "w1_max": 600,   # کلمه‌ی خودکار ۱
-    "w2_on": False, "w2_word": "", "w2_min": 300, "w2_max": 600,   # کلمه‌ی خودکار ۲
+    "w2_on": False, "w2_word": "", "w2_min": 300, "w2_max": 600,   # سازگاری با نسخه‌های قدیمی
+    "word_items": [],
+    "group_enabled": True,
     "running": False,            # بعد از ری‌استارت/دیپلوی خودکار ادامه پیدا می‌کند
     "title": ""                  # اسم گروه (برای پنل)
 }
@@ -294,7 +297,10 @@ def get_settings(chat_id):
 
     if key not in settings:
 
-        settings[key] = DEFAULT_SETTINGS.copy()
+        new_config = DEFAULT_SETTINGS.copy()
+        new_config["word_items"] = []
+        new_config["word_items_migrated"] = True
+        settings[key] = new_config
         save_settings()
 
     else:
@@ -306,7 +312,10 @@ def get_settings(chat_id):
             current["timer_on"] = False
 
         for name, value in DEFAULT_SETTINGS.items():
-            current.setdefault(name, value)
+            if name == "word_items":
+                current.setdefault(name, [])
+            else:
+                current.setdefault(name, value)
 
     return settings[key]
 
@@ -1060,6 +1069,8 @@ async def click_final_button(message):
 async def run_cycle(chat_id, test=False, trigger="timer"):
 
     config = get_settings(chat_id)
+    if not config.get("group_enabled", True):
+        return False
 
     async with get_lock(chat_id):
 
@@ -1284,6 +1295,10 @@ async def automatic_loop(chat_id, skip_first=False):
 
     while True:
 
+        current_config = get_settings(chat_id)
+        if not current_config.get("running", True) or not current_config.get("group_enabled", True):
+            return
+
         if trigger is None:
             trigger = await wait_for_trigger(chat_id, timer_base)
 
@@ -1496,6 +1511,8 @@ async def command_handler(event):
         return
 
     config = get_settings(chat_id)
+    if not config.get("group_enabled", True) and command != "/PANEL":
+        return
 
     # -----------------------------------------------------
     # START
@@ -1532,26 +1549,12 @@ async def command_handler(event):
 
     elif command == "/STOP":
 
-        config["running"] = False
-        save_settings()
-
-        task = tasks.get(chat_id)
-
-        if task and not task.done():
-
-            task.cancel()
-
-            await send_report(
-                chat_id,
-                "⏹ درخواست توقف ارسال شد."
-            )
-
-        else:
-
-            await send_report(
-                chat_id,
-                "مدیریت خودکار فعال نیست."
-            )
+        was_running = bool(config.get("running")) or bool(tasks.get(chat_id) and not tasks[chat_id].done())
+        await stop_factory_task(CUR.get(), chat_id, report=False)
+        await send_report(
+            chat_id,
+            "⏹ مدیریت خودکار کارخانه متوقف شد." if was_running else "مدیریت خودکار فعال نبود."
+        )
 
     # -----------------------------------------------------
     # TEST
@@ -2455,6 +2458,9 @@ async def automatic_battle_loop(
 
         while True:
 
+            if not get_settings(chat_id).get("group_enabled", True):
+                return
+
             if first_cycle:
 
                 before_id = command_message_id
@@ -2573,6 +2579,9 @@ async def battle_command_handler(event):
     )
 
     chat_id = event.chat_id
+
+    if not get_settings(chat_id).get("group_enabled", True):
+        return
 
     if not CUR.get().feature("battle"):
 
@@ -2918,86 +2927,220 @@ async def wait_for_trigger(chat_id, timer_base):
 
 
 # ---------------------------------------------------------
-# کلمه‌های خودکار (دو تای مستقل، هرکدام با کلمه و تایمر خودش)
+# کلمه‌های خودکار (تعداد نامحدود، هرکدام با تایمر مستقل)
 # ---------------------------------------------------------
 
-def word_line(config, slot):
+def get_word_items(config):
 
-    word = config.get(f"w{slot}_word") or "—"
+    """Return independently identified automatic words, migrating legacy slots once."""
+    items = config.get("word_items")
+    if not isinstance(items, list):
+        items = []
+        config["word_items"] = items
 
-    low = int(config.get(f"w{slot}_min", 300))
-    high = int(config.get(f"w{slot}_max", 600))
+    # Legacy w1/w2 values are imported once only. Without this marker, deleting
+    # the last new-style word could cause old values to reappear on the next view.
+    if not config.get("word_items_migrated", False):
+        if not items:
+            for slot in (1, 2):
+                old_word = str(config.get(f"w{slot}_word", "") or "").strip()
+                old_on = bool(config.get(f"w{slot}_on", False))
+                if old_word or old_on:
+                    items.append({
+                        "id": f"legacy-{slot}-{secrets.token_hex(3)}",
+                        "word": old_word,
+                        "min": int(config.get(f"w{slot}_min", 300)),
+                        "max": int(config.get(f"w{slot}_max", 600)),
+                        "on": old_on
+                    })
+        config["word_items_migrated"] = True
 
-    span = (
-        f"{low / 60:g} دقیقه"
-        if high <= low
-        else f"{low / 60:g} تا {high / 60:g} دقیقه"
-    )
+    # Repair duplicate/missing IDs so each word owns a distinct asyncio task
+    # and timer. Normalize malformed timing values without sharing state.
+    seen_ids = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        word_id = str(item.get("id") or "").strip()
+        if not word_id or word_id in seen_ids:
+            word_id = secrets.token_hex(4)
+            item["id"] = word_id
+        seen_ids.add(word_id)
+        item.setdefault("word", "")
+        item.setdefault("min", 300)
+        item.setdefault("max", 600)
+        item.setdefault("on", False)
+        try:
+            low = max(10, int(item.get("min", 300)))
+        except (TypeError, ValueError):
+            low = 300
+        try:
+            high = max(low, int(item.get("max", low)))
+        except (TypeError, ValueError):
+            high = low
+        item["min"], item["max"] = low, high
 
-    state = "روشن" if config.get(f"w{slot}_on") else "خاموش"
+    # Remove malformed entries rather than allowing one bad JSON item to
+    # interrupt every word loop in this account.
+    config["word_items"] = [item for item in items if isinstance(item, dict)]
+    return config["word_items"]
 
-    return f"{word} | هر {span} | {state}"
+
+def find_word_item(config, word_id):
+
+    return next((item for item in get_word_items(config) if str(item.get("id")) == str(word_id)), None)
 
 
-async def word_loop(chat_id, slot):
+def word_line(item):
 
-    print(f"[WORD] Started slot {slot} chat={chat_id}")
+    word = item.get("word") or "—"
+    low = int(item.get("min", 300))
+    high = int(item.get("max", 600))
+    span = f"{low / 60:g} دقیقه" if high <= low else f"{low / 60:g} تا {high / 60:g} دقیقه"
+    return f"{word} | هر {span} | {'روشن' if item.get('on') else 'خاموش'}"
 
+
+async def word_loop(chat_id, word_id):
+
+    account = CUR.get()
+    print(f"[WORD] Started id={word_id} chat={chat_id} account={account.id}")
     try:
-
         while True:
-
             config = get_settings(chat_id)
-
-            if not config.get(f"w{slot}_on") or not CUR.get().feature("words"):
+            item = find_word_item(config, word_id)
+            if (
+                not item or not item.get("on")
+                or not config.get("group_enabled", True)
+                or not account.feature("words")
+                or not account.is_active()
+            ):
                 return
 
-            low = int(config.get(f"w{slot}_min", 300))
-            high = int(config.get(f"w{slot}_max", 600))
-
-            # ثانیه‌ی تصادفی هم حفظ می‌شود
+            low = max(10, int(item.get("min", 300)))
+            high = max(low, int(item.get("max", low)))
             delay = low if high <= low else random.randint(low, high)
-
             await asyncio.sleep(delay)
 
+            # Re-read this exact word after sleeping. Editing/deleting/toggling
+            # another word cannot alter this task's text or timing.
             config = get_settings(chat_id)
-
-            if not config.get(f"w{slot}_on"):
+            item = find_word_item(config, word_id)
+            if (
+                not item or not item.get("on")
+                or not config.get("group_enabled", True)
+                or not account.feature("words")
+                or not account.is_active()
+            ):
                 return
 
-            word = config.get(f"w{slot}_word")
-
-            if word and CUR.get().is_active():
-
+            message_text = str(item.get("word") or "").strip()
+            if message_text:
                 try:
-
-                    await client.send_message(chat_id, word)
-
-                    print(f"[WORD] Sent slot {slot}:", word)
-
+                    await account.client.send_message(chat_id, message_text)
                 except asyncio.CancelledError:
-
                     raise
-
                 except Exception as error:
-
-                    print("[WORD ERROR]", repr(error))
-
+                    print(f"[WORD ERROR] account={account.id} chat={chat_id} id={word_id}: {error!r}")
     except asyncio.CancelledError:
-
-        print(f"[WORD] Stopped slot {slot} chat={chat_id}")
+        print(f"[WORD] Stopped id={word_id} chat={chat_id} account={account.id}")
         raise
 
 
-def start_word_loop(chat_id, slot):
+def start_word_loop(chat_id, word_id):
 
     account = CUR.get()
-    key = (chat_id, slot)
+    config = account.settings.get(str(chat_id), {})
+    item = find_word_item(config, word_id)
+    if (
+        item is None or not item.get("on") or not str(item.get("word") or "").strip()
+        or not config.get("group_enabled", True)
+        or not account.authorized or not account.is_active()
+        or not account.feature("words")
+    ):
+        return
 
+    key = (int(chat_id), str(word_id))
     task = account.word_tasks.get(key)
-
     if task is None or task.done():
-        account.word_tasks[key] = asyncio.create_task(word_loop(chat_id, slot))
+        # Task inherits this account's context; each (group, word ID) is unique.
+        account.word_tasks[key] = asyncio.create_task(word_loop(int(chat_id), str(word_id)))
+
+
+async def stop_factory_task(account, chat_id, report=False):
+
+    """Stop only this group's factory loop and persist the stopped state."""
+    chat_id = int(chat_id)
+    config = account.settings.get(str(chat_id), {})
+    config["running"] = False
+    account.settings[str(chat_id)] = config
+
+    token = CUR.set(account)
+    try:
+        # Wake a task waiting for the next timer, then cancel it so an in-flight
+        # factory operation is also interrupted and its event handlers are cleaned.
+        get_interval_event(chat_id).set()
+        save_settings()
+    finally:
+        CUR.reset(token)
+
+    task = account.tasks.get(chat_id)
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as error:
+            print("[FACTORY STOP ERROR]", repr(error))
+    account.tasks.pop(chat_id, None)
+
+    if report:
+        token = CUR.set(account)
+        try:
+            await send_report(chat_id, "⏹ مدیریت خودکار کارخانه متوقف شد.")
+        finally:
+            CUR.reset(token)
+
+
+async def pause_group_tasks(account, chat_id):
+
+    chat_id = int(chat_id)
+    pending = []
+    for group in (account.tasks, account.battle_tasks, account.energy_tasks, account.word_tasks):
+        for key, task in list(group.items()):
+            key_chat = key[0] if isinstance(key, tuple) else key
+            if int(key_chat) == chat_id and task is not None and not task.done():
+                task.cancel()
+                pending.append(task)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def resume_group_tasks(account, chat_id):
+
+    chat_id = int(chat_id)
+    config = account.settings.get(str(chat_id), {})
+    if not config.get("group_enabled", True) or not account.authorized or not account.is_active():
+        return
+    token = CUR.set(account)
+    try:
+        if config.get("running") and account.feature("factory"):
+            task = account.tasks.get(chat_id)
+            if task is None or task.done():
+                account.tasks[chat_id] = asyncio.create_task(automatic_loop(chat_id, skip_first=True))
+        if account.feature("words"):
+            for item in get_word_items(config):
+                if item.get("on"):
+                    start_word_loop(chat_id, str(item.get("id")))
+        if account.feature("battle"):
+            battle = account.battle_settings.get(str(chat_id), {})
+            for target in list(battle.get("targets", [])):
+                key = (chat_id, target)
+                task = account.battle_tasks.get(key)
+                if task is None or task.done():
+                    account.battle_tasks[key] = asyncio.create_task(automatic_battle_loop(chat_id, None, target))
+    finally:
+        CUR.reset(token)
 
 
 ENERGY_PHRASE = "انرژی کافی نداری"
@@ -3102,6 +3245,8 @@ async def energy_watch_handler(event):
         return
 
     config = get_settings(chat_id)
+    if not config.get("group_enabled", True):
+        return
 
     if not config.get("energy"):
         return
@@ -3152,6 +3297,9 @@ def default_state():
         "codes": {},
         "invite_codes": {},
         "invites": {},
+        "support_tickets": {},
+        "admin_permissions": {},
+        "invite_settings": {"inviter_days": 2, "invitee_days": 1},
         "requests": {},
         "shop": {
             "enabled": True,
@@ -3184,6 +3332,9 @@ def load_bot_state():
 
                 for key, value in data.items():
                     STATE[key] = value
+                STATE.setdefault("invite_settings", {"inviter_days": INVITE_INVITER_DAYS, "invitee_days": INVITE_JOINER_DAYS})
+                STATE.setdefault("admin_permissions", {})
+                STATE.setdefault("support_tickets", {})
 
     except Exception as error:
 
@@ -3291,13 +3442,19 @@ def get_user(user_id):
             "joined": int(time.time()),
             "invite_used": False,
             "invite_last_created": 0,
-            "invite_code": None
+            "invite_code": None,
+            "invited_by": None,
+            "invite_code_used": None,
+            "invite_record_id": None
         }
 
     user = STATE["users"][key]
     user.setdefault("invite_used", False)
     user.setdefault("invite_last_created", 0)
     user.setdefault("invite_code", None)
+    user.setdefault("invited_by", None)
+    user.setdefault("invite_code_used", None)
+    user.setdefault("invite_record_id", None)
     return user
 
 
@@ -3438,12 +3595,19 @@ async def complete_invitation(invitee_id, invite_code, invitee_account_id):
     info["uses"] = len(info["used_by"])
     info["last_used"] = now
 
-    inviter_days = INVITE_INVITER_DAYS
-    invitee_days = INVITE_JOINER_DAYS
+    invite_settings = STATE.setdefault("invite_settings", {"inviter_days": INVITE_INVITER_DAYS, "invitee_days": INVITE_JOINER_DAYS})
+    inviter_days = int(invite_settings.get("inviter_days", INVITE_INVITER_DAYS))
+    invitee_days = int(invite_settings.get("invitee_days", INVITE_JOINER_DAYS))
 
     # Award the invitee on the newly connected account.
     add_days_to_user_or_account(invitee_id, invitee_days, invitee_account_id)
-    # The inviter may not yet have an active session; preserve the reward as credit.
+    # Record whether the inviter's reward became account time or an activatable credit,
+    # so an invalid referral can revoke the correct balance later.
+    inviter_account_id = find_user_account(inviter_id)
+    inviter_account = accounts.get(inviter_account_id) if inviter_account_id else None
+    inviter_reward_account_id = (
+        inviter_account_id if inviter_account_id and inviter_account is not None and inviter_account.authorized else None
+    )
     add_days_to_user_or_account(inviter_id, inviter_days)
 
     invites[invite_id] = {
@@ -3456,12 +3620,22 @@ async def complete_invitation(invitee_id, invite_code, invitee_account_id):
         "connected_at": now,
         "inviter_bonus_days": inviter_days,
         "invitee_bonus_days": invitee_days,
+        "inviter_reward_account_id": inviter_reward_account_id,
+        "inviter_reward_was_credit": inviter_reward_account_id is None,
         "last_activity_at": 0,
+        "activity_count": 0,
+        "activity_days": [],
         "active": False,
-        "inactivity_reported": False
+        "inactivity_reported": False,
+        "review_status": "watching",
+        "reward_revoked": False
     }
 
-    get_user(invitee_id)["invite_used"] = True
+    invitee_user = get_user(invitee_id)
+    invitee_user["invite_used"] = True
+    invitee_user["invited_by"] = inviter_id
+    invitee_user["invite_code_used"] = code_key
+    invitee_user["invite_record_id"] = invite_id
     save_bot_state()
 
     await notify(
@@ -3481,39 +3655,218 @@ async def complete_invitation(invitee_id, invite_code, invitee_account_id):
         f"دعوت‌شونده: {user_label(invitee_id)} [{invitee_id}]\n"
         f"کد: {code_key}\nوضعیت فعالیت: در انتظار استفاده واقعی از سلف"
     )
+    return invitee_days
 
 
 def record_invite_activity(account, event):
 
-    """Only a successful outgoing group command from the invited self counts."""
+    """Track repeated, real outgoing group commands for referral quality review."""
     try:
         if not event.is_group or not event.out:
             return
         command = (event.raw_text or "").strip().split(maxsplit=1)
-        if not command or command[0].upper() not in ("/GO", "/START", "/TEST", "/N"):
+        # bind() invokes this only after a recognized self command handler
+        # completes. Count the full supported command set, not just /GO and /N.
+        if not command or not command[0].startswith("/"):
+            return
+        group_config = account.settings.get(str(event.chat_id), {})
+        if not group_config.get("group_enabled", True):
             return
         holder = int(account.meta.get("bot_user", 0) or 0)
         if not holder:
             return
         _, invites = invite_store()
         now = int(time.time())
+        today = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
         changed = False
         for invite in invites.values():
             if int(invite.get("invitee_id", 0)) != holder:
                 continue
-            if invite.get("active"):
+            if invite.get("review_status") in ("valid", "invalid"):
                 continue
-            invite["active"] = True
+            invite["activity_count"] = int(invite.get("activity_count", 0)) + 1
+            days = invite.setdefault("activity_days", [])
+            if today not in days:
+                days.append(today)
+                days.sort()
             invite["last_activity_at"] = now
             invite["activity_chat_id"] = int(event.chat_id)
             invite["activity_command"] = (event.raw_text or "").split()[0][:32]
+            invite["active"] = (
+                int(invite.get("activity_count", 0)) >= 3
+                and len(invite.get("activity_days", [])) >= 2
+            )
+            if invite["active"]:
+                invite["review_status"] = "active"
             changed = True
             break
         if changed:
             save_bot_state()
-            print(f"[INVITE] verified activity from user={holder}")
     except Exception as error:
         print("[INVITE ACTIVITY ERROR]", repr(error))
+
+
+ADMIN_PERMISSION_LABELS = {
+    "accounts": "📋 مشاهده و روشن/خاموش‌کردن اکانت‌ها",
+    "codes": "🎟 ساخت کد ویژه",
+    "broadcast": "📢 پیام همگانی",
+    "invites": "👥 بررسی دعوت‌ها و اعتبارسنجی",
+    "support": "📨 پشتیبانی و گفت‌وگو با کاربران"
+}
+
+
+def admin_has_permission(user_id, permission):
+
+    if int(user_id) == OWNER_ID:
+        return True
+    if int(user_id) not in [int(x) for x in STATE.get("admins", [])]:
+        return False
+    all_permissions = STATE.setdefault("admin_permissions", {})
+    configured = all_permissions.get(str(user_id))
+    # ادمین‌های قدیمی، تا وقتی مالک تنظیماتشان را تغییر نداده، رفتار قبلی را حفظ می‌کنند.
+    if configured is None:
+        return permission in ADMIN_PERMISSION_LABELS
+    return bool(configured.get(permission, False))
+
+
+def admin_permissions_panel(admin_id):
+
+    permissions = STATE.setdefault("admin_permissions", {}).get(str(admin_id))
+    if permissions is None:
+        permissions = {key: True for key in ADMIN_PERMISSION_LABELS}
+    lines = [
+        f"👮 دسترسی‌های {user_label(admin_id)}",
+        "━━━━━━━━━━━━━━━━━━"
+    ]
+    rows = []
+    for key, label in ADMIN_PERMISSION_LABELS.items():
+        enabled = bool(permissions.get(key, False))
+        lines.append(f"{'✅' if enabled else '⛔'} {label}")
+        rows.append([Button.inline(
+            f"{'🟢 فعال' if enabled else '⚪ غیرفعال'} | {label}",
+            data=f"admperm:{admin_id}:{key}".encode()
+        )])
+    rows.append([Button.inline("⬅️ بازگشت", data=b"admins")])
+    return "\n".join(lines), rows
+
+
+def users_panel():
+
+    users = list(STATE.get("users", {}).items())[-25:]
+    lines = ["👥 کاربران ربات", "━━━━━━━━━━━━━━━━━━"]
+    rows = []
+    if not users:
+        lines.append("هنوز کاربری ثبت نشده است.")
+    for uid, user in reversed(users):
+        lines.append(f"• {user.get('name') or uid} | {uid}")
+        rows.append([Button.inline(
+            f"🔎 {user.get('name') or uid} ({uid})",
+            data=f"userdet:{uid}".encode()
+        )])
+    rows.append(back_button())
+    return "\n".join(lines), rows
+
+
+def user_detail_panel(user_id):
+
+    user = get_user(int(user_id))
+    inviter = user.get("invited_by")
+    invite_text = f"توضیحات: اضافه شده توسط {user_label(inviter)} [{inviter}]" if inviter else "توضیحات: ثبت‌نام مستقیم / بدون کد دعوت"
+    ticket_count = sum(1 for item in STATE.get("support_tickets", {}).values() if int(item.get("user_id", 0)) == int(user_id))
+    account_id = find_user_account(int(user_id))
+    username = f"@{user.get('username')}" if user.get("username") else "—"
+    text = (
+        f"👤 اطلاعات کاربر\n━━━━━━━━━━━━━━━━━━\n"
+        f"نام: {user.get('name') or '—'}\n"
+        f"شناسه: {user_id}\n"
+        f"یوزرنیم: {username}\n"
+        f"{invite_text}\n"
+        f"کد دعوت استفاده‌شده: {user.get('invite_code_used') or '—'}\n"
+        f"تعداد تیکت‌ها: {ticket_count}\n"
+        f"اکانت متصل: {accounts_meta.get(account_id, {}).get('name', account_id) if account_id else 'ندارد'}\n"
+        f"اعتبار آماده فعال‌سازی: {int(user.get('entitled_days', 0))} روز"
+    )
+    return text, [[Button.inline("⬅️ بازگشت به کاربران", data=b"users")]]
+
+
+def support_store():
+
+    STATE.setdefault("support_tickets", {})
+    return STATE["support_tickets"]
+
+
+def support_list_panel():
+
+    tickets = list(support_store().values())[-20:]
+    lines = ["📨 صندوق باگ‌ها و پیشنهادها", "━━━━━━━━━━━━━━━━━━"]
+    rows = []
+    if not tickets:
+        lines.append("تیکتی ثبت نشده است.")
+    for item in reversed(tickets):
+        status = "🟢 باز" if item.get("status", "open") == "open" else "⚫ بسته"
+        lines.append(f"#{item['id']} | {item.get('kind_label', 'پیام')} | {user_label(item['user_id'])} | {status}")
+        rows.append([Button.inline(
+            f"#{item['id']} • {item.get('kind_label', 'پیام')} • {item.get('user_id')}",
+            data=f"ticket:{item['id']}".encode()
+        )])
+    rows.append(back_button())
+    return "\n".join(lines), rows
+
+
+def support_ticket_panel(ticket_id):
+
+    item = support_store().get(str(ticket_id))
+    if not item:
+        return "این گفت‌وگو پیدا نشد.", [back_button(b"supportlist")]
+    history = item.get("messages", [])[-12:]
+    lines = [
+        f"📨 گفت‌وگوی #{ticket_id} — {item.get('kind_label', 'پیام')}",
+        "━━━━━━━━━━━━━━━━━━",
+        f"کاربر: {user_label(item['user_id'])} [{item['user_id']}]",
+        f"وضعیت: {'باز' if item.get('status', 'open') == 'open' else 'بسته'}",
+        ""
+    ]
+    for msg in history:
+        sender = "کاربر" if msg.get("from") == "user" else "پشتیبانی"
+        preview = msg.get("text") or ("[رسانه]" if msg.get("media") else "[پیام]")
+        lines.append(f"{sender}: {preview[:180]}")
+    rows = [[Button.inline("✍️ پاسخ / ادامه گفت‌وگو", data=f"ticketreply:{ticket_id}".encode())]]
+    if item.get("status", "open") == "open":
+        rows.append([Button.inline("🔒 بستن گفت‌وگو", data=f"ticketclose:{ticket_id}".encode())])
+    rows.append([Button.inline("⬅️ صندوق پشتیبانی", data=b"supportlist")])
+    return "\n".join(lines), rows
+
+
+async def relay_ticket_message(event, target_id, header=""):
+
+    message = event.message
+    body = (message.message or "").strip()
+    caption = (header + ("\n" if header and body else "") + body).strip()
+    if message.media:
+        try:
+            payload = await message.download_media(file=bytes)
+            if payload:
+                document = getattr(message, "document", None)
+                attributes = getattr(document, "attributes", None) if document else None
+                mime_type = getattr(document, "mime_type", None) if document else None
+                await bot.send_file(
+                    int(target_id), payload,
+                    caption=caption or None,
+                    attributes=attributes,
+                    mime_type=mime_type,
+                    force_document=False
+                )
+                return
+        except Exception as error:
+            print("[TICKET MEDIA RELAY ERROR]", repr(error))
+        try:
+            await message.forward_to(int(target_id))
+            return
+        except Exception as error:
+            print("[TICKET FORWARD ERROR]", repr(error))
+            await bot.send_message(int(target_id), caption or "⚠️ دریافت رسانه ناموفق بود.")
+            return
+    await bot.send_message(int(target_id), caption or "[پیام خالی]")
 
 
 def invite_user_panel(user_id):
@@ -3526,26 +3879,36 @@ def invite_user_panel(user_id):
     remaining = max(0, INVITE_CREATE_INTERVAL - (int(time.time()) - last_created)) if last_created else 0
     used = int(info.get("uses", 0)) if info else 0
     successful = sum(1 for item in invites.values() if int(item.get("inviter_id", 0)) == int(user_id))
+    left = max(0, INVITE_MAX_USES - used)
 
     lines = [
-        "🎟 دعوت کاربران",
+        "🎟 کد دعوت",
         "━━━━━━━━━━━━━━━━━━",
-        f"استفاده از کدهای تو: {used}/{INVITE_MAX_USES}",
         f"دعوت‌های ثبت‌شده: {successful}",
-        "جایزه دعوت‌کننده: ۲ روز | دعوت‌شونده: ۱ روز",
+        f"ظرفیت مصرف کد فعلی: {used}/{INVITE_MAX_USES}",
+        f"دفعات باقی‌مانده کد فعلی: {left}",
+        "هر کد حداکثر ۳ بار استفاده می‌شود.",
+        "هر کاربر فقط یک‌بار می‌تواند از سیستم دعوت استفاده کند.",
+        "ساخت کد جدید: هر ۱۴ روز یک‌بار.",
+        f"جایزه فعلی: دعوت‌کننده {int(STATE.get('invite_settings', {}).get('inviter_days', INVITE_INVITER_DAYS))} روز؛ دعوت‌شونده {int(STATE.get('invite_settings', {}).get('invitee_days', INVITE_JOINER_DAYS))} روز.",
         ""
     ]
     rows = []
-    if info and remaining > 0:
-        lines.append(f"کد فعلی تو: `{code}`")
-        lines.append(f"امکان ساخت کد جدید تا: {math.ceil(remaining / 86400)} روز دیگر")
+    if info:
+        lines.append(f"کد فعلی: `{code}`")
+        if left == 0:
+            lines.append("⚠️ ظرفیت این کد تکمیل شده است.")
         rows.append([Button.inline("📋 نمایش کد دعوت من", data=b"invshow")])
-    elif info and used < INVITE_MAX_USES:
-        lines.append(f"کد فعلی تو: `{code}`")
-        rows.append([Button.inline("📋 نمایش کد دعوت من", data=b"invshow")])
-        rows.append([Button.inline("♻️ ساخت کد جدید", data=b"invmake")])
     else:
-        lines.append("هنوز کد فعالی نداری یا ظرفیت کد قبلی تکمیل شده است.")
+        lines.append("هنوز کد دعوتی نساخته‌ای.")
+
+    if remaining > 0:
+        days = remaining // 86400
+        hours = (remaining % 86400) // 3600
+        minutes = (remaining % 3600) // 60
+        lines.append(f"⏳ زمان باقی‌مانده تا امکان ساخت کد بعدی: {days} روز و {hours} ساعت و {minutes} دقیقه")
+        rows.append([Button.inline("⏳ زمان ساخت کد بعدی", data=b"invshow")])
+    else:
         rows.append([Button.inline("➕ ساخت کد دعوت", data=b"invmake")])
 
     rows.append([Button.inline("✍️ وارد کردن کد دعوت", data=b"inventer")])
@@ -3562,7 +3925,11 @@ def owner_invites_panel():
     if not items:
         lines.append("هنوز دعوتی ثبت نشده است.")
     for item in reversed(items):
-        state = "🟢 فعال" if item.get("active") else "🟡 در انتظار فعالیت"
+        state = {
+            "watching": "🟡 در حال پایش", "active": "🟢 فعال",
+            "pending": "🟠 نیازمند بررسی", "valid": "✅ معتبر",
+            "invalid": "❌ نامعتبر"
+        }.get(item.get("review_status", "active" if item.get("active") else "watching"), "—")
         lines.append(
             f"#{item['id']} | {user_label(item['invitee_id'])}\n"
             f"دعوت‌کننده: {user_label(item['inviter_id'])}\nوضعیت: {state}"
@@ -3581,22 +3948,37 @@ def owner_invite_detail(invite_id):
     item = invites.get(str(invite_id))
     if not item:
         return "این دعوت پیدا نشد.", [back_button(b"invlist")]
-    active = bool(item.get("active"))
+    review = item.get("review_status", "active" if item.get("active") else "watching")
+    review_text = {
+        "watching": "🟡 در حال پایش",
+        "active": "🟢 فعال",
+        "pending": "🟠 نیازمند بررسی ادمین/مالک",
+        "valid": "✅ معتبر تأیید شد",
+        "invalid": "❌ نامعتبر؛ جایزه دعوت‌کننده لغو شد"
+    }.get(review, review)
     text = (
         f"👥 جزئیات دعوت #{invite_id}\n━━━━━━━━━━━━━━━━━━\n"
         f"دعوت‌کننده: {user_label(item['inviter_id'])} [{item['inviter_id']}]\n"
         f"دعوت‌شونده: {user_label(item['invitee_id'])} [{item['invitee_id']}]\n"
         f"کد: {item.get('code', '—')}\n"
-        f"وضعیت: {'🟢 فعال؛ دستور سلف اجرا شده' if active else '🟡 هنوز فعالیت واقعی ثبت نشده'}\n"
+        f"وضعیت: {review_text}\n"
+        f"تعداد فعالیت ثبت‌شده: {int(item.get('activity_count', 0))}\n"
+        f"روزهای فعال: {len(item.get('activity_days', []))}\n"
+        f"آخرین فعالیت: {datetime.fromtimestamp(int(item.get('last_activity_at', 0))).strftime('%Y-%m-%d %H:%M') if item.get('last_activity_at') else 'ثبت نشده'}\n"
         f"جایزه دعوت‌کننده: {item.get('inviter_bonus_days', INVITE_INVITER_DAYS)} روز\n"
         f"جایزه دعوت‌شونده: {item.get('invitee_bonus_days', INVITE_JOINER_DAYS)} روز\n"
         f"تاریخ ثبت: {datetime.fromtimestamp(int(item.get('created', 0))).strftime('%Y-%m-%d %H:%M')}"
     )
     rows = [
         [Button.inline("✏️ تغییر جایزه دعوت‌کننده", data=f"invedit:{invite_id}:inviter".encode())],
-        [Button.inline("✏️ تغییر جایزه دعوت‌شونده", data=f"invedit:{invite_id}:invitee".encode())],
-        [Button.inline("⬅️ بازگشت به دعوت‌ها", data=b"invlist")]
+        [Button.inline("✏️ تغییر جایزه دعوت‌شونده", data=f"invedit:{invite_id}:invitee".encode())]
     ]
+    if review == "pending":
+        rows.append([
+            Button.inline("✅ معتبر است", data=f"invvalid:{invite_id}".encode()),
+            Button.inline("❌ نامعتبر؛ لغو جایزه دعوت‌کننده", data=f"invinvalid:{invite_id}".encode())
+        ])
+    rows.append([Button.inline("⬅️ بازگشت به دعوت‌ها", data=b"invlist")])
     return text, rows
 
 
@@ -3757,7 +4139,7 @@ def resume_account(account):
 
         for key, config in list(account.settings.items()):
 
-            if isinstance(config, dict) and config.get("running") and account.feature("factory"):
+            if isinstance(config, dict) and config.get("running") and config.get("group_enabled", True) and account.feature("factory"):
 
                 chat_id = int(key)
                 task = account.tasks.get(chat_id)
@@ -3772,12 +4154,12 @@ def resume_account(account):
 
         for key, config in list(account.settings.items()):
 
-            if isinstance(config, dict):
+            if isinstance(config, dict) and config.get("group_enabled", True):
 
-                for slot in (1, 2):
-
-                    if config.get(f"w{slot}_on") and account.feature("words"):
-                        start_word_loop(int(key), slot)
+                if account.feature("words"):
+                    for item in get_word_items(config):
+                        if item.get("on"):
+                            start_word_loop(int(key), str(item.get("id")))
 
         for key, data in list(account.battle_settings.items()):
 
@@ -3994,21 +4376,28 @@ async def expiry_watcher():
             # دعوت‌هایی که تا ۷ روز پس از اتصال هیچ دستور گروهی واقعی اجرا نکرده‌اند، گزارش می‌شوند.
             _, invite_records = invite_store()
             for invite in invite_records.values():
-                if invite.get("active") or invite.get("inactivity_reported"):
+                if invite.get("review_status") in ("active", "valid", "invalid", "pending") or invite.get("inactivity_reported"):
                     continue
                 connected_at = int(invite.get("connected_at", invite.get("created", now)))
                 if now - connected_at >= INVITE_ACTIVITY_WINDOW:
                     invite["inactivity_reported"] = True
+                    invite["review_status"] = "pending"
                     save_bot_state()
                     report = (
-                        f"⚠️ دعوت مشکوک؛ فعالیت ثبت نشده (#{invite.get('id')})\n"
+                        f"⚠️ بررسی اعتبار دعوت (#{invite.get('id')})\n"
                         f"دعوت‌کننده: {user_label(invite.get('inviter_id'))} [{invite.get('inviter_id')}]\n"
                         f"دعوت‌شونده: {user_label(invite.get('invitee_id'))} [{invite.get('invitee_id')}]\n"
-                        "تا ۷ روز پس از اتصال، هیچ دستور گروهی از سلف دعوت‌شونده ثبت نشده است."
+                        f"فعالیت ثبت‌شده: {int(invite.get('activity_count', 0))} دستور در {len(invite.get('activity_days', []))} روز\n"
+                        "فعالیت کافی در ۷ روز نخست دیده نشده؛ درباره معتبر بودن دعوت تصمیم بگیرید."
                     )
-                    await notify(OWNER_ID, report)
+                    buttons = [[
+                        Button.inline("✅ معتبر", data=f"invvalid:{invite.get('id')}".encode()),
+                        Button.inline("❌ نامعتبر؛ لغو جایزه دعوت‌کننده", data=f"invinvalid:{invite.get('id')}".encode())
+                    ]]
+                    await notify(OWNER_ID, report, buttons=buttons)
                     for admin_id in list(STATE.get("admins", [])):
-                        await notify(int(admin_id), report)
+                        if admin_has_permission(int(admin_id), "invites"):
+                            await notify(int(admin_id), report, buttons=buttons)
 
             for account_id, meta in list(accounts_meta.items()):
 
@@ -4213,7 +4602,9 @@ def user_menu(user_id):
         [Button.inline("🎁 اشتراک تست یک‌روزه", data=b"trial")],
         [Button.inline("🔑 استفاده از کد ویژه", data=b"usecode")],
         [Button.inline("🛒 خرید اشتراک", data=b"buy")],
-        [Button.inline("🎟 دعوت کاربران", data=b"invmenu")]
+        [Button.inline("🎟 کد دعوت", data=b"invmenu")],
+        [Button.inline("🐞 گزارش باگ", data=b"bug")],
+        [Button.inline("💡 پیشنهاد بروزرسانی", data=b"suggest")]
     ]
 
     if find_user_account(user_id):
@@ -4260,12 +4651,18 @@ def user_status_panel(user_id):
 
 def admin_menu(user_id=None):
 
-    rows = [
-        [Button.inline(f"📋 اکانت‌ها ({len(accounts_meta)}/{MAX_ACCOUNTS})", data=b"accs")],
-        [Button.inline("🎟 ساخت کد ویژه", data=b"newcode")],
-        [Button.inline("📢 پیام همگانی", data=b"bc")],
-        [Button.inline("⚙️ پنل سلف من", data=b"spm")]
-    ]
+    rows = []
+    if admin_has_permission(user_id, "accounts"):
+        rows.append([Button.inline(f"📋 اکانت‌ها ({len(accounts_meta)}/{MAX_ACCOUNTS})", data=b"accs")])
+    if admin_has_permission(user_id, "codes"):
+        rows.append([Button.inline("🎟 ساخت کد ویژه", data=b"newcode")])
+    if admin_has_permission(user_id, "broadcast"):
+        rows.append([Button.inline("📢 پیام همگانی", data=b"bc")])
+    if admin_has_permission(user_id, "invites"):
+        rows.append([Button.inline("👥 بررسی دعوت‌ها", data=b"invlist")])
+    if admin_has_permission(user_id, "support"):
+        rows.append([Button.inline("📨 صندوق باگ‌ها و پیشنهادها", data=b"supportlist")])
+    rows.append([Button.inline("⚙️ پنل سلف من", data=b"spm")])
 
     own_line = ""
     own_id = find_user_account(user_id) if user_id else None
@@ -4284,7 +4681,7 @@ def admin_menu(user_id=None):
         "🛡 پنل ادمین\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"{own_line}"
-        "می‌توانی سلف اکانت‌ها را خاموش/روشن کنی و کد ویژه بسازی."
+        "دسترسی‌های فعال تو از تنظیمات مالک مشخص می‌شود. از دکمه‌های زیر استفاده کن."
     )
 
     return text, rows
@@ -4320,6 +4717,9 @@ def owner_menu():
         [Button.inline("♻️ بازیابی از پشتیبان", data=b"restore")],
         [Button.inline("⚙️ پنل سلف من", data=b"spm")],
         [Button.inline("👥 کاربران دعوت‌شده", data=b"invlist")],
+        [Button.inline("🎁 تنظیم جایزه دعوت", data=b"invreward")],
+        [Button.inline("👤 کاربران", data=b"users")],
+        [Button.inline("📨 صندوق باگ‌ها و پیشنهادها", data=b"supportlist")],
         [Button.inline(global_label, data=b"gtog")]
     ]
 
@@ -4510,28 +4910,45 @@ def request_panel(request_id):
 def admins_panel():
 
     lines = [
-        "👮 ادمین‌ها",
+        "👮 مدیریت ادمین‌ها",
         "━━━━━━━━━━━━━━━━━━",
-        "ادمین فقط می‌تواند سلف اکانت‌ها را خاموش/روشن کند و کد ویژه بسازد."
+        "برای هر ادمین می‌توانی دسترسی‌ها را جداگانه تنظیم کنی."
     ]
-
+    rows = []
     if not STATE["admins"]:
         lines.append("\nهنوز ادمینی تعیین نشده است.")
-
-    rows = []
-
     for admin_id in STATE["admins"]:
-
-        rows.append([
-            Button.inline(
-                f"❌ عزل {user_label(admin_id)}",
-                data=f"adm_rm:{admin_id}".encode()
-            )
-        ])
-
+        rows.append([Button.inline(
+            f"⚙️ دسترسی‌ها: {user_label(admin_id)}",
+            data=f"admmanage:{admin_id}".encode()
+        )])
+        rows.append([Button.inline(
+            f"❌ عزل {user_label(admin_id)}",
+            data=f"adm_rm:{admin_id}".encode()
+        )])
     rows.append([Button.inline("➕ افزودن ادمین", data=b"adm_add")])
+    if STATE["admins"]:
+        rows.append([Button.inline("🌐 تنظیم دسترسی‌ها برای همه ادمین‌ها", data=b"admglobalmenu")])
+        rows.append([
+            Button.inline("✅ فعال‌سازی همه دسترسی‌ها", data=b"adm_all_on"),
+            Button.inline("⛔ قطع همه دسترسی‌ها", data=b"adm_all_off")
+        ])
     rows.append(back_button())
+    return "\n".join(lines), rows
 
+
+def admin_global_permissions_panel():
+
+    lines = ["🌐 دسترسی‌های عمومی ادمین‌ها", "━━━━━━━━━━━━━━━━━━", "با هر دکمه، همان دسترسی برای همه ادمین‌ها فعال یا غیرفعال می‌شود."]
+    rows = []
+    admin_ids = [int(x) for x in STATE.get("admins", [])]
+    for key, label in ADMIN_PERMISSION_LABELS.items():
+        enabled = bool(admin_ids) and all(admin_has_permission(admin_id, key) for admin_id in admin_ids)
+        rows.append([Button.inline(
+            f"{'🟢 فعال برای همه' if enabled else '⚪ غیرفعال برای بعضی/همه'} | {label}",
+            data=f"admglobal:{key}".encode()
+        )])
+    rows.append([Button.inline("⬅️ بازگشت", data=b"admins")])
     return "\n".join(lines), rows
 
 
@@ -4595,15 +5012,18 @@ async def start_purpose(event, user_id, purpose):
             if accounts[existing].authorized:
 
                 if purpose.get("kind") == "invite":
-                    await complete_invitation(user_id, purpose.get("code", ""), existing)
+                    try:
+                        shown_days = await complete_invitation(user_id, purpose.get("code", ""), existing)
+                    except ValueError as error:
+                        await event.respond(str(error), buttons=[back_button()])
+                        return
                 else:
                     commit_purpose(user_id, purpose)
                     if days:
                         apply_grant(existing, days)
+                    shown_days = days
 
                 text, rows = user_status_panel(user_id)
-
-                shown_days = INVITE_JOINER_DAYS if purpose.get("kind") == "invite" else days
                 await event.respond(
                     f"✅ سلف روی اکانت قبلی‌ات فعال شد ({shown_days} روز).\n\n{text}",
                     buttons=rows
@@ -4724,15 +5144,24 @@ async def finish_login(event, user_id):
         return
 
     if purpose.get("kind") == "invite":
-        await complete_invitation(user_id, purpose.get("code", ""), account_id)
+        try:
+            shown_days = await complete_invitation(user_id, purpose.get("code", ""), account_id)
+        except ValueError as error:
+            # A code may reach its final use while another person is completing
+            # login. Do not leave a newly connected account without a referral.
+            await remove_account(account_id)
+            await event.respond(
+                f"{error}\nاتصال این اکانت لغو شد؛ از دعوت‌کننده کد دیگری بگیر.",
+                buttons=[back_button()]
+            )
+            return
     else:
         commit_purpose(user_id, purpose)
         if days:
             apply_grant(account_id, days)
+        shown_days = days
 
     text, rows = user_status_panel(user_id)
-
-    shown_days = INVITE_JOINER_DAYS if purpose.get("kind") == "invite" else days
     await event.respond(
         f"✅ سلف روی اکانتت وصل و فعال شد ({shown_days} روز).\n\n{text}",
         buttons=rows
@@ -4932,7 +5361,9 @@ for _op in ("go", "off", "mode", "cap", "price", "product", "timer", "hourly",
             "pre", "interval", "minute", "pminute"):
     PANEL_OP_FEATURES[_op] = ("factory",)
 
-for _op in ("w1", "w2", "w1word", "w1time", "w2word", "w2time"):
+for _op in ("w1", "w2", "w1word", "w1time", "w2word", "w2time",
+            "wordadd", "wordtoggle", "wordtext", "wordtime", "worddel",
+            "word_add", "word_text", "word_time"):
     PANEL_OP_FEATURES[_op] = ("words",)
 
 for _op in ("bdelay", "bword", "btarget", "bx"):
@@ -4964,7 +5395,8 @@ PANEL_PROMPTS = {
     "w1word": "✏️ کلمه‌ی ۱ را بفرست؛ همین متن داخل گروه نوشته می‌شود.",
     "w2word": "✏️ کلمه‌ی ۲ را بفرست؛ همین متن داخل گروه نوشته می‌شود.",
     "w1time": "⏱ زمان کلمه‌ی ۱ را به دقیقه بفرست.\nمثال: 5 10 ← هر بار بین ۵ تا ۱۰ دقیقه | 5 ← دقیقاً ۵ دقیقه",
-    "w2time": "⏱ زمان کلمه‌ی ۲ را به دقیقه بفرست.\nمثال: 5 10 ← هر بار بین ۵ تا ۱۰ دقیقه | 5 ← دقیقاً ۵ دقیقه"
+    "w2time": "⏱ زمان کلمه‌ی ۲ را به دقیقه بفرست.\nمثال: 5 10 ← هر بار بین ۵ تا ۱۰ دقیقه | 5 ← دقیقاً ۵ دقیقه",
+    "wordadd": "✏️ متن کلمه جدید را بفرست؛ بعداً می‌توانی زمان و وضعیتش را جداگانه تنظیم کنی."
 }
 
 
@@ -5014,7 +5446,7 @@ def groups_panel(account_id):
 
                 rows.append([
                     Button.inline(
-                        f"{'▶️' if config.get('running') else '👥'} {group_title(account, chat_key)}",
+                        f"{'🟢' if config.get('group_enabled', True) else '🔴'} {'▶️' if config.get('running') else '👥'} {group_title(account, chat_key)}",
                         data=f"spg:{account_id}:{chat_key}".encode()
                     )
                 ])
@@ -5064,6 +5496,8 @@ def group_panel(account_id, chat_key):
     factory_on = account.feature("factory")
     battle_on = account.feature("battle")
     words_on = account.feature("words")
+    group_enabled = config.get("group_enabled", True)
+    word_items = get_word_items(config)
 
     lock = "🔒 غیرفعال (توسط مالک)"
 
@@ -5071,6 +5505,7 @@ def group_panel(account_id, chat_key):
         f"⚙️ {group_title(account, chat_key)}",
         "━━━━━━━━━━━━━━━━━━",
         f"وضعیت سلف: {status_text(account_id)}",
+        f"وضعیت این گروه: {'🟢 روشن' if group_enabled else '🔴 خاموش'}",
         ""
     ]
 
@@ -5098,8 +5533,12 @@ def group_panel(account_id, chat_key):
 
     if words_on:
 
-        lines.append(f"🗣 کلمه ۱: {word_line(config, 1)}")
-        lines.append(f"🗣 کلمه ۲: {word_line(config, 2)}")
+        if word_items:
+            lines.append(f"🗣 کلمه‌های خودکار ({len(word_items)} مورد):")
+            for index, item in enumerate(word_items, 1):
+                lines.append(f"{index}. {word_line(item)}")
+        else:
+            lines.append("🗣 هنوز کلمه خودکاری اضافه نشده است.")
 
     else:
 
@@ -5149,7 +5588,10 @@ def group_panel(account_id, chat_key):
     def dot(flag):
         return "🟢" if flag else "⚪"
 
-    rows = []
+    rows = [
+        [key("🔴 خاموش‌کردن سلف در این گروه" if group_enabled else "🟢 روشن‌کردن سلف در این گروه", "grouptoggle"),
+         key("🗑 حذف سلف از این گروه", "groupleave")]
+    ]
 
     if factory_on:
 
@@ -5185,13 +5627,15 @@ def group_panel(account_id, chat_key):
 
     if words_on:
 
-        for slot in (1, 2):
-
+        rows.append([key("➕ افزودن کلمه جدید", "wordadd")])
+        for index, item in enumerate(word_items, 1):
+            word_id = str(item.get("id"))
             rows.append([
-                key(f"{dot(bool(config.get(f'w{slot}_on')))} کلمه {slot}", f"w{slot}"),
-                key("✏️ کلمه", f"w{slot}word"),
-                key("⏱ زمان", f"w{slot}time")
+                key(f"{dot(bool(item.get('on')))} کلمه {index}", "wordtoggle", word_id),
+                key("✏️ متن", "wordtext", word_id),
+                key("⏱ زمان", "wordtime", word_id)
             ])
+            rows.append([key(f"🗑 حذف کلمه {index}", "worddel", word_id)])
 
     if battle_on:
 
@@ -5260,6 +5704,42 @@ async def resolve_battle_target(account, chat_id, value):
     ) or getattr(entity, "username", None) or str(entity.id)
 
     return entity.id, name, getattr(entity, "username", None)
+
+
+def apply_word_panel_input(account, chat_key, field, text, word_id=None):
+
+    config = account.settings[str(chat_key)]
+    items = get_word_items(config)
+    value = (text or "").strip()
+    if field == "word_add":
+        if not value:
+            return False, "❌ متن کلمه خالی است."
+        word_id = secrets.token_hex(3)
+        items.append({"id": word_id, "word": value, "min": 300, "max": 600, "on": False})
+        save_settings()
+        return True, f"✅ کلمه جدید اضافه شد (شناسه {word_id}). زمان پیش‌فرض: ۵ تا ۱۰ دقیقه؛ در صورت نیاز تغییرش بده."
+    item = find_word_item(config, word_id)
+    if item is None:
+        return False, "❌ این کلمه دیگر وجود ندارد."
+    if field == "word_text":
+        if not value:
+            return False, "❌ متن کلمه خالی است."
+        item["word"] = value
+    elif field == "word_time":
+        raw = normalize_digits(value)
+        numbers = re.findall(r"\d+(?:[.,٫]\d+)?", raw)
+        if not numbers:
+            return False, "❌ یک یا دو عدد دقیقه بفرست؛ مثال: 5 10"
+        values = [float(x.replace(",", ".").replace("٫", ".")) for x in numbers[:2]]
+        low, high = sorted(values[:2]) if len(values) > 1 else (values[0], values[0])
+        if low <= 0:
+            return False, "❌ زمان باید بیشتر از صفر باشد."
+        item["min"] = max(10, int(low * 60))
+        item["max"] = max(item["min"], int(high * 60))
+    else:
+        return False, "❌ گزینه نامعتبر است."
+    save_settings()
+    return True, "✅ تنظیمات کلمه ذخیره شد."
 
 
 def apply_panel_input(account, chat_key, field, text):
@@ -5858,9 +6338,12 @@ async def dispatch_callback(event, user_id, action, argument):
         code = user.get("invite_code")
         if not code or code not in invite_store()[0]:
             return "هنوز کد دعوتی نداری."
+        info = invite_store()[0].get(code, {})
+        used = int(info.get("uses", 0))
+        left = max(0, INVITE_MAX_USES - used)
         await show(
             event,
-            f"🎟 کد دعوت تو\\n━━━━━━━━━━━━━━━━━━\\n`{code}`\\n\\nاین کد حداکثر ۳ بار قابل استفاده است.",
+            f"🎟 کد دعوت تو\\n━━━━━━━━━━━━━━━━━━\\n`{code}`\\n\\nاستفاده‌شده: {used}/{INVITE_MAX_USES}\\nدفعات باقی‌مانده: {left}\\nهر کاربر فقط یک‌بار می‌تواند از سیستم دعوت استفاده کند.",
             [[Button.inline("⬅️ بازگشت", data=b"invmenu")]]
         )
         return None
@@ -5869,9 +6352,19 @@ async def dispatch_callback(event, user_id, action, argument):
 
         code, wait_seconds = create_user_invite_code(user_id)
         if code is None:
-            return f"⏳ برای ساخت کد جدید باید {math.ceil(wait_seconds / 86400)} روز دیگر صبر کنی."
+            days = wait_seconds // 86400
+            hours = (wait_seconds % 86400) // 3600
+            minutes = (wait_seconds % 3600) // 60
+            return f"⏳ کد جدید هنوز قابل ساخت نیست؛ {days} روز و {hours} ساعت و {minutes} دقیقه دیگر دوباره تلاش کن."
         text, rows = invite_user_panel(user_id)
-        await show(event, f"✅ کد دعوت ساخته شد:\\n`{code}`\\n\\n{text}", rows)
+        if wait_seconds > 0:
+            await show(
+                event,
+                f"ℹ️ قبلاً در این بازه کد ساخته‌ای؛ کد فعلی تو همچنان قابل استفاده است:\n`{code}`\n\n{text}",
+                rows
+            )
+        else:
+            await show(event, f"✅ کد دعوت جدید ساخته شد:\n`{code}`\n\n{text}", rows)
         return None
 
     if action == "inventer":
@@ -5879,6 +6372,18 @@ async def dispatch_callback(event, user_id, action, argument):
         await clear_flow(user_id)
         flows[user_id] = {"step": "invite_code"}
         await event.respond("✍️ کد دعوت را بفرست.\\nبرای لغو: /cancel")
+        return None
+
+    if action in ("bug", "suggest"):
+
+        await clear_flow(user_id)
+        kind_label = "گزارش باگ" if action == "bug" else "پیشنهاد بروزرسانی"
+        flows[user_id] = {"step": "support_new", "kind": action, "kind_label": kind_label}
+        await event.respond(
+            f"{ '🐞' if action == 'bug' else '💡' } {kind_label}\n"
+            "پیام، عکس، ویدیو، فایل، ویس، گیف یا استیکر را بفرست.\n"
+            "بعد از ثبت، از همین گفت‌وگو می‌توانی با پشتیبانی ادامه بدهی.\nبرای لغو: /cancel"
+        )
         return None
 
     if action == "buy":
@@ -6075,6 +6580,33 @@ async def dispatch_callback(event, user_id, action, argument):
         await show(event, text, rows)
         return None
 
+    if action == "spremoveok":
+        account_id, _, chat_key = argument.partition(":")
+        account = owned_account(user_id, account_id)
+        if account is None:
+            return "این اکانت مال تو نیست یا وجود ندارد."
+        if chat_key not in account.settings:
+            return "این گروه دیگر ثبت نشده است."
+        chat_id = int(chat_key)
+        await pause_group_tasks(account, chat_id)
+        try:
+            await account.client.delete_dialog(chat_id)
+        except Exception as error:
+            print("[GROUP LEAVE ERROR]", repr(error))
+            return "❌ خروج از گروه انجام نشد. مطمئن شو سلف هنوز عضو گروه است و دسترسی تلگرام دارد."
+        account.settings.pop(chat_key, None)
+        account.battle_settings.pop(chat_key, None)
+        token = CUR.set(account)
+        try:
+            save_settings()
+            save_battle_settings()
+        finally:
+            CUR.reset(token)
+        await event.respond("✅ سلف از گروه خارج شد و تنظیمات آن گروه حذف شد.")
+        text, rows = groups_panel(account_id)
+        await show(event, text, rows)
+        return None
+
     if action == "spo":
 
         op, _, rest = argument.partition(":")
@@ -6097,6 +6629,17 @@ async def dispatch_callback(event, user_id, action, argument):
 
         chat_id = int(chat_key)
 
+        if op in ("wordtext", "wordtime"):
+            await clear_flow(user_id)
+            flows[user_id] = {
+                "step": "pset", "account_id": account_id,
+                "chat_key": chat_key, "field": "word_text" if op == "wordtext" else "word_time",
+                "word_id": extra
+            }
+            prompt = "✏️ متن جدید این کلمه را بفرست." if op == "wordtext" else "⏱ زمان را به دقیقه بفرست؛ مثال 5 یا 5 10 (برای همین کلمه مستقل است)."
+            await event.respond(prompt + "\n\nبرای لغو: /cancel")
+            return None
+
         if op in PANEL_PROMPTS:
 
             await clear_flow(user_id)
@@ -6105,7 +6648,7 @@ async def dispatch_callback(event, user_id, action, argument):
                 "step": "pset",
                 "account_id": account_id,
                 "chat_key": chat_key,
-                "field": op
+                "field": "word_add" if op == "wordadd" else op
             }
 
             await event.respond(PANEL_PROMPTS[op] + "\n\nبرای لغو: /cancel")
@@ -6117,7 +6660,62 @@ async def dispatch_callback(event, user_id, action, argument):
 
             config = get_settings(chat_id)
 
-            if op == "go":
+            if op == "grouptoggle":
+                config["group_enabled"] = not config.get("group_enabled", True)
+                save_settings()
+                if not config["group_enabled"]:
+                    await pause_group_tasks(account, chat_id)
+                else:
+                    await resume_group_tasks(account, chat_id)
+
+            elif op == "groupleave":
+                await show(event, f"🗑 سلف «{group_title(account, chat_key)}» از این گروه خارج شود؟\nتنظیمات همین گروه نیز پاک می‌شود.", [
+                    [Button.inline("✅ خروج و حذف گروه", data=f"spremoveok:{account_id}:{chat_key}".encode())],
+                    [Button.inline("⬅️ انصراف", data=f"spg:{account_id}:{chat_key}".encode())]
+                ])
+                return None
+
+            elif op == "wordtoggle":
+                item = find_word_item(config, extra)
+                if item is None:
+                    return "این کلمه دیگر وجود ندارد."
+                item["on"] = not item.get("on", False)
+                save_settings()
+                key_word = (chat_id, str(extra))
+                word_task = account.word_tasks.get(key_word)
+                if item["on"]:
+                    if not item.get("word"):
+                        item["on"] = False
+                        save_settings()
+                        return "اول متن کلمه را تنظیم کن."
+                    if config.get("group_enabled", True):
+                        start_word_loop(chat_id, str(extra))
+                elif word_task is not None and not word_task.done():
+                    word_task.cancel()
+                    try:
+                        await word_task
+                    except asyncio.CancelledError:
+                        pass
+
+            elif op == "worddel":
+                item = find_word_item(config, extra)
+                if item is None:
+                    return "این کلمه دیگر وجود ندارد."
+                item["on"] = False
+                config["word_items"] = [x for x in get_word_items(config) if str(x.get("id")) != str(extra)]
+                word_task = account.word_tasks.get((chat_id, str(extra)))
+                if word_task is not None and not word_task.done():
+                    word_task.cancel()
+                    try:
+                        await word_task
+                    except asyncio.CancelledError:
+                        pass
+                save_settings()
+
+            elif op == "go":
+
+                if not config.get("group_enabled", True):
+                    return "ابتدا سلف را در همین گروه روشن کن."
 
                 if not account.authorized or not account.is_active():
                     return "سلف الان خاموش یا منقضی است."
@@ -6135,13 +6733,7 @@ async def dispatch_callback(event, user_id, action, argument):
 
             elif op == "off":
 
-                task = account.tasks.get(chat_id)
-
-                if task is not None and not task.done():
-                    task.cancel()
-
-                config["running"] = False
-                save_settings()
+                await stop_factory_task(account, chat_id, report=False)
 
             elif op == "mode":
 
@@ -6189,27 +6781,18 @@ async def dispatch_callback(event, user_id, action, argument):
 
             elif op in ("w1", "w2"):
 
-                slot = int(op[1])
-
-                if not config.get(f"w{slot}_on"):
-
-                    if not config.get(f"w{slot}_word"):
-                        return "اول کلمه را تنظیم کن (✏️ کلمه)."
-
-                    config[f"w{slot}_on"] = True
-                    save_settings()
-
+                slot = op[1]
+                item = find_word_item(config, slot)
+                if item is None:
+                    return "این کلمه در تنظیمات قدیمی وجود ندارد."
+                item["on"] = not item.get("on", False)
+                if item["on"] and item.get("word") and config.get("group_enabled", True):
                     start_word_loop(chat_id, slot)
-
                 else:
-
-                    config[f"w{slot}_on"] = False
-                    save_settings()
-
-                    word_task = account.word_tasks.get((chat_id, slot))
-
-                    if word_task is not None and not word_task.done():
-                        word_task.cancel()
+                    task_word = account.word_tasks.get((chat_id, slot))
+                    if task_word is not None and not task_word.done():
+                        task_word.cancel()
+                save_settings()
 
         finally:
 
@@ -6299,10 +6882,75 @@ async def dispatch_callback(event, user_id, action, argument):
         await show(event, "✅ اکانتت حذف شد.\n\n" + text, rows)
         return None
 
+    if action == "ticketuser":
+        item = support_store().get(argument)
+        if item is None or int(item.get("user_id", 0)) != int(user_id) or item.get("status", "open") != "open":
+            return "این گفت‌وگو در دسترس نیست یا بسته شده است."
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "support_user_reply", "ticket_id": argument}
+        await event.respond("✍️ پیام بعدی‌ات را برای پشتیبانی بفرست؛ رسانه هم قابل ارسال است.\nبرای لغو: /cancel")
+        return None
+
     # ---------- ادمین و مالک ----------
 
     if not is_staff:
         return "⛔ دسترسی نداری."
+
+    if role == "admin":
+        required_permission = {
+            "accs": "accounts", "acc": "accounts", "tog": "accounts",
+            "newcode": "codes", "bc": "broadcast", "bc_ok": "broadcast",
+            "bc_no": "broadcast", "invlist": "invites", "invdet": "invites",
+            "invedit": "invites", "invvalid": "invites", "invinvalid": "invites",
+            "supportlist": "support", "ticket": "support", "ticketreply": "support",
+            "ticketclose": "support"
+        }.get(action)
+        if required_permission and not admin_has_permission(user_id, required_permission):
+            return "⛔ مالک دسترسی این بخش را برای تو فعال نکرده است."
+
+    if action == "supportlist":
+        text, rows = support_list_panel()
+        await show(event, text, rows)
+        return None
+
+    if action == "ticket":
+        item = support_store().get(argument)
+        if item is None:
+            return "این گفت‌وگو پیدا نشد."
+        text, rows = support_ticket_panel(argument)
+        await show(event, text, rows)
+        return None
+
+    if action == "ticketreply":
+        item = support_store().get(argument)
+        if item is None or item.get("status", "open") != "open":
+            return "این گفت‌وگو بسته شده یا وجود ندارد."
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "support_reply", "ticket_id": argument}
+        await event.respond("✍️ پاسخ خود را بفرست؛ متن، عکس، ویس، گیف، استیکر و فایل پشتیبانی می‌شود.\nبرای لغو: /cancel")
+        return None
+
+    if action == "ticketclose":
+        item = support_store().get(argument)
+        if item is None:
+            return "این گفت‌وگو پیدا نشد."
+        item["status"] = "closed"
+        item["closed_at"] = int(time.time())
+        save_bot_state()
+        await notify(int(item["user_id"]), f"🔒 گفت‌وگوی پشتیبانی #{argument} بسته شد. اگر موضوع تازه‌ای داری از /start یک گزارش جدید ثبت کن.")
+        text, rows = support_ticket_panel(argument)
+        await show(event, text, rows)
+        return None
+
+    if action == "users" and is_owner:
+        text, rows = users_panel()
+        await show(event, text, rows)
+        return None
+
+    if action == "userdet" and is_owner:
+        text, rows = user_detail_panel(argument)
+        await show(event, text, rows)
+        return None
 
     if action == "accs":
 
@@ -6411,31 +7059,96 @@ async def dispatch_callback(event, user_id, action, argument):
         await show(event, text, rows)
         return None
 
-    # ---------- فقط مالک ----------
-
-    if not is_owner:
-        return "⛔ این بخش فقط برای مالک است."
-
     if action == "invlist":
 
-        if not is_owner:
-            return "⛔ این بخش فقط برای مالک است."
         text, rows = owner_invites_panel()
         await show(event, text, rows)
         return None
 
     if action == "invdet":
 
-        if not is_owner:
-            return "⛔ این بخش فقط برای مالک است."
         text, rows = owner_invite_detail(argument)
         await show(event, text, rows)
+        return None
+
+    if action in ("invvalid", "invinvalid"):
+        invite_id = argument
+        invite = invite_store()[1].get(str(invite_id))
+        if invite is None:
+            return "این دعوت پیدا نشد."
+        if invite.get("review_status") not in ("pending", "watching", "active"):
+            return "این دعوت قبلاً تعیین تکلیف شده است."
+        if action == "invvalid":
+            invite["review_status"] = "valid"
+            invite["reviewed_by"] = user_id
+            invite["reviewed_at"] = int(time.time())
+            save_bot_state()
+            await notify(int(invite["inviter_id"]), f"✅ دعوت ثبت‌شده توسط تو (#{invite_id}) معتبر تأیید شد.")
+            result = "✅ دعوت معتبر تأیید شد."
+        else:
+            if invite.get("reward_revoked"):
+                return "جایزه این دعوت قبلاً لغو شده است."
+            inviter_id = int(invite["inviter_id"])
+            days = int(invite.get("inviter_bonus_days", INVITE_INVITER_DAYS))
+            if "inviter_reward_account_id" in invite:
+                account_id = invite.get("inviter_reward_account_id")
+            else:
+                legacy_account_id = find_user_account(inviter_id)
+                legacy_account = accounts.get(legacy_account_id) if legacy_account_id else None
+                account_id = legacy_account_id if legacy_account is not None and legacy_account.authorized else None
+            if account_id and account_id in accounts_meta:
+                meta = accounts_meta[account_id]
+                expires = meta.get("expires_at")
+                if expires:
+                    updated = max(int(time.time()), int(expires - days * 86400))
+                    meta["expires_at"] = updated
+                    if updated <= time.time():
+                        meta["enabled"] = False
+                        account_obj = accounts.get(account_id)
+                        if account_obj:
+                            account_obj.stop_tasks()
+                    save_accounts_meta()
+                else:
+                    inviter_user = get_user(inviter_id)
+                    inviter_user["entitled_days"] = max(0, int(inviter_user.get("entitled_days", 0)) - days)
+                    save_bot_state()
+            else:
+                inviter_user = get_user(inviter_id)
+                inviter_user["entitled_days"] = max(0, int(inviter_user.get("entitled_days", 0)) - days)
+                save_bot_state()
+            invite["review_status"] = "invalid"
+            invite["reward_revoked"] = True
+            invite["reviewed_by"] = user_id
+            invite["reviewed_at"] = int(time.time())
+            save_bot_state()
+            await notify(inviter_id, f"⚠️ دعوت #{invite_id} نامعتبر تشخیص داده شد؛ جایزه {days} روزه دعوت‌کننده لغو شد.")
+            result = f"❌ دعوت نامعتبر شد و {days} روز جایزه دعوت‌کننده لغو شد."
+        detail, rows = owner_invite_detail(invite_id)
+        await show(event, result + "\n\n" + detail, rows)
+        return None
+
+
+    # ---------- فقط مالک ----------
+
+    if not is_owner:
+        return "⛔ این بخش فقط برای مالک است."
+
+    if action == "invreward":
+        if not is_owner:
+            return "⛔ فقط مالک می‌تواند جایزه دعوت را تغییر دهد."
+        current = STATE.setdefault("invite_settings", {"inviter_days": INVITE_INVITER_DAYS, "invitee_days": INVITE_JOINER_DAYS})
+        await clear_flow(user_id)
+        flows[user_id] = {"step": "invite_reward_settings"}
+        await event.respond(
+            f"🎁 تنظیم جایزه دعوت\nفعلی: دعوت‌کننده {current.get('inviter_days', 2)} روز، دعوت‌شونده {current.get('invitee_days', 1)} روز.\n"
+            "دو عدد بفرست: روز دعوت‌کننده سپس روز دعوت‌شونده. مثال: 2 1\nبرای لغو: /cancel"
+        )
         return None
 
     if action == "invedit":
 
         if not is_owner:
-            return "⛔ این بخش فقط برای مالک است."
+            return "⛔ تغییر روزهای جایزه فقط برای مالک است."
         invite_id, _, target = argument.partition(":")
         if invite_id not in invite_store()[1] or target not in ("inviter", "invitee"):
             return "اطلاعات دعوت معتبر نیست."
@@ -6452,6 +7165,7 @@ async def dispatch_callback(event, user_id, action, argument):
             "برای لغو: /cancel"
         )
         return None
+
 
     if action == "addown":
 
@@ -6789,6 +7503,65 @@ async def dispatch_callback(event, user_id, action, argument):
         await show(event, text, rows)
         return None
 
+    if action == "admglobalmenu":
+        text, rows = admin_global_permissions_panel()
+        await show(event, text, rows)
+        return None
+
+    if action == "admglobal":
+        permission = argument
+        if permission not in ADMIN_PERMISSION_LABELS:
+            return "دسترسی نامعتبر است."
+        admin_ids = [int(x) for x in STATE.get("admins", [])]
+        currently_all = bool(admin_ids) and all(admin_has_permission(admin_id, permission) for admin_id in admin_ids)
+        enabled = not currently_all
+        all_permissions = STATE.setdefault("admin_permissions", {})
+        for admin_id in admin_ids:
+            current = all_permissions.get(str(admin_id))
+            if current is None:
+                current = {key: True for key in ADMIN_PERMISSION_LABELS}
+            current[permission] = enabled
+            all_permissions[str(admin_id)] = current
+        save_bot_state()
+        text, rows = admin_global_permissions_panel()
+        await show(event, text, rows)
+        return None
+
+    if action == "admmanage":
+        if argument.isdigit() and int(argument) in [int(x) for x in STATE.get("admins", [])]:
+            text, rows = admin_permissions_panel(int(argument))
+            await show(event, text, rows)
+            return None
+        return "این ادمین وجود ندارد."
+
+    if action == "admperm":
+        admin_text, _, permission = argument.partition(":")
+        if not admin_text.isdigit() or permission not in ADMIN_PERMISSION_LABELS:
+            return "دسترسی نامعتبر است."
+        admin_id = int(admin_text)
+        if admin_id not in [int(x) for x in STATE.get("admins", [])]:
+            return "این ادمین وجود ندارد."
+        all_permissions = STATE.setdefault("admin_permissions", {})
+        current = all_permissions.get(str(admin_id))
+        if current is None:
+            current = {key: True for key in ADMIN_PERMISSION_LABELS}
+        current[permission] = not bool(current.get(permission, False))
+        all_permissions[str(admin_id)] = current
+        save_bot_state()
+        text, rows = admin_permissions_panel(admin_id)
+        await show(event, text, rows)
+        return None
+
+    if action in ("adm_all_on", "adm_all_off"):
+        enabled = action == "adm_all_on"
+        all_permissions = STATE.setdefault("admin_permissions", {})
+        for admin_id in STATE.get("admins", []):
+            all_permissions[str(admin_id)] = {key: enabled for key in ADMIN_PERMISSION_LABELS}
+        save_bot_state()
+        text, rows = admins_panel()
+        await show(event, "✅ دسترسی‌ها برای همه ادمین‌ها به‌روزرسانی شد.\n\n" + text, rows)
+        return None
+
     if action == "admins":
 
         text, rows = admins_panel()
@@ -6813,6 +7586,7 @@ async def dispatch_callback(event, user_id, action, argument):
         if admin_id in STATE["admins"]:
 
             STATE["admins"].remove(admin_id)
+            STATE.setdefault("admin_permissions", {}).pop(str(admin_id), None)
             save_bot_state()
 
             await notify(admin_id, "ℹ️ دسترسی ادمین تو توسط مالک برداشته شد.")
@@ -6948,6 +7722,21 @@ async def bot_message_handler(event):
         await start_purpose(event, user_id, {"kind": "invite", "code": code_key})
         return
 
+    if step == "invite_reward_settings" and role == "owner":
+        numbers = re.findall(r"\d+", normalize_digits(text))
+        if len(numbers) < 2:
+            await event.respond("❌ دو عدد بفرست؛ مثال: 2 1")
+            return
+        inviter_days, invitee_days = int(numbers[0]), int(numbers[1])
+        if inviter_days > 3650 or invitee_days > 3650:
+            await event.respond("❌ هر مقدار باید حداکثر ۳۶۵۰ روز باشد.")
+            return
+        STATE["invite_settings"] = {"inviter_days": inviter_days, "invitee_days": invitee_days}
+        save_bot_state()
+        await clear_flow(user_id)
+        await event.respond(f"✅ جایزه دعوت از این پس تنظیم شد: دعوت‌کننده {inviter_days} روز، دعوت‌شونده {invitee_days} روز. این تغییر روی دعوت‌های بعدی اعمال می‌شود.", buttons=[back_button()])
+        return
+
     if step == "invite_days" and role == "owner":
 
         try:
@@ -7017,6 +7806,77 @@ async def bot_message_handler(event):
         detail, rows = owner_invite_detail(invite_id)
         await event.respond(f"✅ جایزه به‌روزرسانی شد.\\n\\n{detail}", buttons=rows)
         await notify(target_user, f"ℹ️ مدت جایزه دعوت تو توسط مالک به {new_days} روز تغییر کرد.")
+        return
+
+    # ---------- پشتیبانی: ساخت تیکت و ادامه گفت‌وگو ----------
+
+    if step == "support_new":
+        tickets = support_store()
+        ticket_id = new_numeric_id(tickets)
+        kind = flow.get("kind", "bug")
+        kind_label = flow.get("kind_label", "گزارش")
+        item = {
+            "id": ticket_id,
+            "user_id": int(user_id),
+            "kind": kind,
+            "kind_label": kind_label,
+            "status": "open",
+            "created": int(time.time()),
+            "messages": [{
+                "from": "user", "text": (event.raw_text or "")[:1000],
+                "media": bool(event.message.media), "time": int(time.time())
+            }]
+        }
+        tickets[ticket_id] = item
+        save_bot_state()
+        await clear_flow(user_id)
+        header = f"🆕 تیکت #{ticket_id} — {kind_label}\nکاربر: {user_label(user_id)} [{user_id}]"
+        for staff_id in [OWNER_ID] + [int(x) for x in STATE.get("admins", []) if admin_has_permission(int(x), "support")]:
+            try:
+                await relay_ticket_message(event, staff_id, header)
+                await notify(staff_id, f"برای پاسخ به تیکت #{ticket_id} وارد صندوق پشتیبانی شو.", buttons=[[Button.inline("📨 باز کردن گفت‌وگو", data=f"ticket:{ticket_id}".encode())]])
+            except Exception as error:
+                print("[TICKET NOTIFY ERROR]", repr(error))
+        await event.respond(
+            f"✅ {kind_label} با شماره #{ticket_id} ثبت شد.\nپشتیبانی از همین بخش پاسخ می‌دهد.",
+            buttons=[[Button.inline("💬 ادامه گفت‌وگو", data=f"ticketuser:{ticket_id}".encode())], back_button()]
+        )
+        return
+
+    if step in ("support_reply", "support_user_reply"):
+        ticket_id = str(flow.get("ticket_id"))
+        item = support_store().get(ticket_id)
+        if item is None or item.get("status", "open") != "open":
+            await clear_flow(user_id)
+            await event.respond("این گفت‌وگو بسته شده یا وجود ندارد.")
+            return
+        is_staff_reply = step == "support_reply"
+        if is_staff_reply and not (role == "owner" or admin_has_permission(user_id, "support")):
+            await clear_flow(user_id)
+            await event.respond("⛔ دسترسی پشتیبانی نداری.")
+            return
+        if not is_staff_reply and int(item.get("user_id", 0)) != int(user_id):
+            await clear_flow(user_id)
+            await event.respond("این گفت‌وگو متعلق به تو نیست.")
+            return
+        item.setdefault("messages", []).append({
+            "from": "staff" if is_staff_reply else "user",
+            "text": (event.raw_text or "")[:1000],
+            "media": bool(event.message.media), "time": int(time.time()),
+            "sender_id": int(user_id)
+        })
+        save_bot_state()
+        target = int(item["user_id"]) if is_staff_reply else None
+        header = f"💬 پاسخ پشتیبانی — تیکت #{ticket_id}" if is_staff_reply else f"💬 پیام جدید کاربر — تیکت #{ticket_id}"
+        if is_staff_reply:
+            await relay_ticket_message(event, target, header)
+            await event.respond("✅ پاسخ برای کاربر ارسال شد.")
+        else:
+            staff_targets = [OWNER_ID] + [int(x) for x in STATE.get("admins", []) if admin_has_permission(int(x), "support")]
+            for staff_id in set(staff_targets):
+                await relay_ticket_message(event, staff_id, f"{header}\nکاربر: {user_label(user_id)}")
+                await notify(staff_id, f"پیام تازه در تیکت #{ticket_id} دریافت شد.", buttons=[[Button.inline("📨 باز کردن گفت‌وگو", data=f"ticket:{ticket_id}".encode())]])
+            await event.respond("✅ پیام تو برای پشتیبانی ارسال شد.")
         return
 
     # ---------- کد ویژه ----------
@@ -7413,12 +8273,20 @@ async def bot_message_handler(event):
             )
             return
 
-        ok, message = apply_panel_input(
-            account,
-            flow["chat_key"],
-            flow["field"],
-            text
-        )
+        if flow["field"] in ("word_add", "word_text", "word_time"):
+            ok, message = apply_word_panel_input(
+                account, flow["chat_key"], flow["field"], text, flow.get("word_id")
+            )
+            if ok and flow["field"] == "word_add":
+                # After adding, user can configure its own timer from the group panel.
+                pass
+        else:
+            ok, message = apply_panel_input(
+                account,
+                flow["chat_key"],
+                flow["field"],
+                text
+            )
 
         if not ok:
 
@@ -7616,6 +8484,9 @@ async def bot_message_handler(event):
         if admin_id not in STATE["admins"]:
 
             STATE["admins"].append(admin_id)
+            STATE.setdefault("admin_permissions", {})[str(admin_id)] = {
+                key: True for key in ADMIN_PERMISSION_LABELS
+            }
             save_bot_state()
 
         await clear_flow(user_id)
