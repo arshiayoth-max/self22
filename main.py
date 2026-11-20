@@ -3417,12 +3417,25 @@ async def load_session_string(account_id):
 # ROLES / USERS
 # ---------------------------------------------------------
 
+# حالت تست عمداً فقط در حافظه نگهداری می‌شود؛ با ری‌استارت ربات خاموش می‌شود.
+# این حالت نقش مدیریتی را برای همان کاربر موقتاً به کاربر عادی تبدیل می‌کند.
+TEST_MODE_USERS = set()
+
+
 def role_of(user_id):
+
+    user_id = int(user_id)
+
+    if user_id in TEST_MODE_USERS:
+        return "user"
 
     if user_id == OWNER_ID:
         return "owner"
 
-    if user_id in STATE["admins"]:
+    if user_id in [int(x) for x in STATE.get("admins", [])]:
+        permissions = STATE.setdefault("admin_permissions", {}).get(str(user_id), {})
+        if bool(permissions.get("owner_full", False)):
+            return "owner"
         return "admin"
 
     return "user"
@@ -3707,8 +3720,8 @@ def record_invite_activity(account, event):
 
 
 ADMIN_PERMISSION_LABELS = {
-    "accounts": "📋 مشاهده و روشن/خاموش‌کردن اکانت‌ها",
-    "codes": "🎟 ساخت کد ویژه",
+    "accounts": "📋 مشاهده و مدیریت اکانت‌ها",
+    "codes": "🎟 ساخت و مدیریت کدهای ویژه",
     "broadcast": "📢 پیام همگانی",
     "invites": "👥 بررسی دعوت‌ها و اعتبارسنجی",
     "support": "📨 پشتیبانی و گفت‌وگو با کاربران"
@@ -3717,15 +3730,25 @@ ADMIN_PERMISSION_LABELS = {
 
 def admin_has_permission(user_id, permission):
 
-    if int(user_id) == OWNER_ID:
-        return True
-    if int(user_id) not in [int(x) for x in STATE.get("admins", [])]:
+    user_id = int(user_id)
+
+    # در حالت تست، حتی مالک و ادمین هم از نظر دسترسی مانند کاربر عادی هستند.
+    if user_id in TEST_MODE_USERS:
         return False
-    all_permissions = STATE.setdefault("admin_permissions", {})
-    configured = all_permissions.get(str(user_id))
-    # ادمین‌های قدیمی، تا وقتی مالک تنظیماتشان را تغییر نداده، رفتار قبلی را حفظ می‌کنند.
+    if user_id == OWNER_ID:
+        return True
+    if user_id not in [int(x) for x in STATE.get("admins", [])]:
+        return False
+
+    configured = STATE.setdefault("admin_permissions", {}).get(str(user_id))
+    # ادمین‌های قدیمی تنظیمات قبلی خود را حفظ می‌کنند؛ اما Full Owner به‌صورت پیش‌فرض خاموش است.
     if configured is None:
         return permission in ADMIN_PERMISSION_LABELS
+
+    if bool(configured.get("owner_full", False)):
+        return True
+    if permission == "owner_full":
+        return False
     return bool(configured.get(permission, False))
 
 
@@ -3734,11 +3757,25 @@ def admin_permissions_panel(admin_id):
     permissions = STATE.setdefault("admin_permissions", {}).get(str(admin_id))
     if permissions is None:
         permissions = {key: True for key in ADMIN_PERMISSION_LABELS}
+        permissions["owner_full"] = False
+
+    full_owner = bool(permissions.get("owner_full", False))
     lines = [
-        f"👮 دسترسی‌های {user_label(admin_id)}",
-        "━━━━━━━━━━━━━━━━━━"
+        "👮 مدیریت دسترسی ادمین",
+        "━━━━━━━━━━━━━━━━━━",
+        f"کاربر: {user_label(admin_id)}",
+        f"دسترسی کامل مالک: {'✅ فعال' if full_owner else '⛔ غیرفعال'}",
+        "",
+        "با فعال‌کردن دسترسی کامل مالک، تمام امکانات پنل مالک در اختیار این ادمین قرار می‌گیرد.",
+        "این گزینه مستقل است و با «فعال‌سازی همه دسترسی‌های معمول» تغییر نمی‌کند.",
+        "",
+        "دسترسی‌های جداگانه:"
     ]
-    rows = []
+    rows = [[Button.inline(
+        f"{'👑 لغو دسترسی کامل مالک' if full_owner else '👑 اعطای دسترسی کامل مالک'}",
+        data=f"admfull:{admin_id}".encode()
+    )]]
+
     for key, label in ADMIN_PERMISSION_LABELS.items():
         enabled = bool(permissions.get(key, False))
         lines.append(f"{'✅' if enabled else '⛔'} {label}")
@@ -3746,7 +3783,8 @@ def admin_permissions_panel(admin_id):
             f"{'🟢 فعال' if enabled else '⚪ غیرفعال'} | {label}",
             data=f"admperm:{admin_id}:{key}".encode()
         )])
-    rows.append([Button.inline("⬅️ بازگشت", data=b"admins")])
+
+    rows.append([Button.inline("⬅️ بازگشت به مدیریت ادمین‌ها", data=b"admins")])
     return "\n".join(lines), rows
 
 
@@ -4612,10 +4650,14 @@ def user_menu(user_id):
         rows.append([Button.inline("⚙️ پنل سلف من", data=b"spm")])
         rows.append([Button.inline("📊 وضعیت من", data=b"status")])
 
+    if int(user_id) in TEST_MODE_USERS:
+        rows.insert(0, [Button.inline("🧪 خروج از حالت تست و بازگشت به پنل مدیریت", data=b"testmode")])
+
     text = (
-        "👋 به ربات سلف خوش آمدی.\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "یکی از گزینه‌ها را انتخاب کن:"
+        ("🧪 حالت تست فعال است؛ نقش تو فعلاً کاربر عادی است.\n" if int(user_id) in TEST_MODE_USERS else "👋 به ربات سلف خوش آمدی.\n")
+        + "━━━━━━━━━━━━━━━━━━\n"
+        + ("توجه: این حالت محیط آزمایشی جداگانه نیست؛ تغییراتی مثل اتصال اکانت یا مصرف اشتراک واقعی ثبت می‌شوند.\n\n" if int(user_id) in TEST_MODE_USERS else "")
+        + "یکی از گزینه‌ها را انتخاب کن:"
     )
 
     return text, rows
@@ -4653,7 +4695,7 @@ def admin_menu(user_id=None):
 
     rows = []
     if admin_has_permission(user_id, "accounts"):
-        rows.append([Button.inline(f"📋 اکانت‌ها ({len(accounts_meta)}/{MAX_ACCOUNTS})", data=b"accs")])
+        rows.append([Button.inline(f"📋 اکانت‌ها  ·  {len(accounts_meta)}/{MAX_ACCOUNTS}", data=b"accs")])
     if admin_has_permission(user_id, "codes"):
         rows.append([Button.inline("🎟 ساخت کد ویژه", data=b"newcode")])
     if admin_has_permission(user_id, "broadcast"):
@@ -4662,53 +4704,57 @@ def admin_menu(user_id=None):
         rows.append([Button.inline("👥 بررسی دعوت‌ها", data=b"invlist")])
     if admin_has_permission(user_id, "support"):
         rows.append([Button.inline("📨 صندوق باگ‌ها و پیشنهادها", data=b"supportlist")])
+
     rows.append([Button.inline("⚙️ پنل سلف من", data=b"spm")])
+    rows.append([Button.inline("🧪 فعال‌کردن حالت تست کاربر عادی", data=b"testmode")])
 
     own_line = ""
     own_id = find_user_account(user_id) if user_id else None
-
     if own_id is not None:
-
         own_meta = accounts_meta[own_id]
-
         own_line = (
-            f"👤 اکانت تو وصل است: {own_meta.get('name', '?')}\n"
-            f"وضعیت سلف: {status_text(own_id)}\n"
-            f"مدت باقی‌مانده: {remaining_text(own_meta)}\n\n"
+            f"\n👤 سلف متصل: {own_meta.get('name', '?')}\n"
+            f"وضعیت: {status_text(own_id)}  ·  اعتبار: {remaining_text(own_meta)}\n"
         )
 
     text = (
-        "🛡 پنل ادمین\n"
+        "🛡 پنل مدیریت\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"{own_line}"
-        "دسترسی‌های فعال تو از تنظیمات مالک مشخص می‌شود. از دکمه‌های زیر استفاده کن."
+        f"{own_line}\n"
+        "از بخش‌های مجاز زیر استفاده کن. دسترسی‌ها توسط مالک تنظیم می‌شوند."
     )
-
     return text, rows
 
 
 def owner_menu():
 
     pending = shop_pending_count()
-
     global_label = (
-        "🟢 روشن کردن سلف روی همه"
+        "🟢 روشن‌کردن سلف در همه اکانت‌ها"
         if STATE.get("global_off")
-        else "🔴 خاموش کردن سلف روی همه"
+        else "🔴 خاموش‌کردن سلف در همه اکانت‌ها"
     )
 
     rows = [
         [
-            Button.inline(f"📋 اکانت‌ها ({len(accounts_meta)}/{MAX_ACCOUNTS})", data=b"accs"),
-            Button.inline("➕ افزودن اکانت من", data=b"addown")
+            Button.inline(f"📋 اکانت‌ها · {len(accounts_meta)}/{MAX_ACCOUNTS}", data=b"accs"),
+            Button.inline("➕ افزودن اکانت", data=b"addown")
         ],
         [
-            Button.inline(f"🏪 فروشگاه ({pending})", data=b"shop"),
+            Button.inline(f"🏪 فروشگاه · {pending} در انتظار", data=b"shop"),
             Button.inline("🎟 ساخت کد ویژه", data=b"newcode")
         ],
         [
-            Button.inline(f"👮 ادمین‌ها ({len(STATE['admins'])})", data=b"admins"),
-            Button.inline("📜 کدها", data=b"codes")
+            Button.inline(f"👮 ادمین‌ها · {len(STATE['admins'])}", data=b"admins"),
+            Button.inline("📜 کدهای ویژه", data=b"codes")
+        ],
+        [
+            Button.inline("👥 کاربران", data=b"users"),
+            Button.inline("👥 کاربران دعوت‌شده", data=b"invlist")
+        ],
+        [
+            Button.inline("🎁 تنظیم پاداش دعوت", data=b"invreward"),
+            Button.inline("📨 پشتیبانی", data=b"supportlist")
         ],
         [
             Button.inline("📢 پیام همگانی", data=b"bc"),
@@ -4716,25 +4762,25 @@ def owner_menu():
         ],
         [Button.inline("♻️ بازیابی از پشتیبان", data=b"restore")],
         [Button.inline("⚙️ پنل سلف من", data=b"spm")],
-        [Button.inline("👥 کاربران دعوت‌شده", data=b"invlist")],
-        [Button.inline("🎁 تنظیم جایزه دعوت", data=b"invreward")],
-        [Button.inline("👤 کاربران", data=b"users")],
-        [Button.inline("📨 صندوق باگ‌ها و پیشنهادها", data=b"supportlist")],
+        [Button.inline("🧪 فعال‌کردن حالت تست کاربر عادی", data=b"testmode")],
         [Button.inline(global_label, data=b"gtog")]
     ]
 
     text = (
         "👑 پنل مالک\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"سلف کلی: {'⛔ خاموش' if STATE.get('global_off') else '🟢 روشن'}\n"
-        f"ظرفیت اکانت‌ها: {len(accounts_meta)}/{MAX_ACCOUNTS}\n"
-        f"رسید در انتظار تایید: {pending}"
+        f"وضعیت سلف سراسری: {'⛔ خاموش' if STATE.get('global_off') else '🟢 روشن'}\n"
+        f"اکانت‌های ثبت‌شده: {len(accounts_meta)} از {MAX_ACCOUNTS}\n"
+        f"رسیدهای در انتظار: {pending}\n\n"
+        "مدیریت اکانت‌ها، کاربران، اشتراک‌ها و تنظیمات ربات"
     )
-
     return text, rows
 
 
 def menu_for(user_id):
+
+    if int(user_id) in TEST_MODE_USERS:
+        return user_menu(user_id)
 
     role = role_of(user_id)
 
@@ -4918,8 +4964,9 @@ def admins_panel():
     if not STATE["admins"]:
         lines.append("\nهنوز ادمینی تعیین نشده است.")
     for admin_id in STATE["admins"]:
+        full_access = bool(STATE.setdefault("admin_permissions", {}).get(str(admin_id), {}).get("owner_full", False))
         rows.append([Button.inline(
-            f"⚙️ دسترسی‌ها: {user_label(admin_id)}",
+            f"{'👑 دسترسی کامل مالک' if full_access else '⚙️ دسترسی‌ها'}: {user_label(admin_id)}",
             data=f"admmanage:{admin_id}".encode()
         )])
         rows.append([Button.inline(
@@ -6295,6 +6342,26 @@ async def dispatch_callback(event, user_id, action, argument):
 
     """اگر رشته‌ای برگرداند، به‌صورت هشدار به کاربر نشان داده می‌شود."""
 
+    # تغییر حالت تست باید حتی وقتی کاربر در حال تست است قابل دسترسی بماند.
+    if action == "testmode":
+        if int(user_id) in TEST_MODE_USERS:
+            TEST_MODE_USERS.discard(int(user_id))
+            await clear_flow(user_id)
+            text, rows = menu_for(user_id)
+            await show(event, "✅ حالت تست خاموش شد؛ دسترسی‌های قبلی تو برگشت.\n\n" + text, rows)
+        else:
+            if role_of(user_id) not in ("owner", "admin"):
+                return "⛔ این گزینه فقط برای مالک و ادمین است."
+            TEST_MODE_USERS.add(int(user_id))
+            await clear_flow(user_id)
+            text, rows = user_menu(user_id)
+            await show(
+                event,
+                "🧪 حالت تست فعال شد.\n\nاکنون ربات با تو مانند یک کاربر عادی رفتار می‌کند و دکمه‌های مدیریتی پنهان و مسدود هستند.\nبرای بازگشت، «خروج از حالت تست» را بزن.\n\n" + text,
+                rows
+            )
+        return None
+
     role = role_of(user_id)
     is_owner = role == "owner"
     is_staff = role in ("owner", "admin")
@@ -7520,6 +7587,7 @@ async def dispatch_callback(event, user_id, action, argument):
             current = all_permissions.get(str(admin_id))
             if current is None:
                 current = {key: True for key in ADMIN_PERMISSION_LABELS}
+                current["owner_full"] = False
             current[permission] = enabled
             all_permissions[str(admin_id)] = current
         save_bot_state()
@@ -7534,6 +7602,25 @@ async def dispatch_callback(event, user_id, action, argument):
             return None
         return "این ادمین وجود ندارد."
 
+    if action == "admfull":
+        if not argument.isdigit():
+            return "شناسه ادمین نامعتبر است."
+        admin_id = int(argument)
+        if admin_id not in [int(x) for x in STATE.get("admins", [])]:
+            return "این ادمین وجود ندارد."
+        all_permissions = STATE.setdefault("admin_permissions", {})
+        current = all_permissions.get(str(admin_id))
+        if current is None:
+            current = {key: True for key in ADMIN_PERMISSION_LABELS}
+            current["owner_full"] = False
+        current["owner_full"] = not bool(current.get("owner_full", False))
+        all_permissions[str(admin_id)] = current
+        save_bot_state()
+        text, rows = admin_permissions_panel(admin_id)
+        state_label = "فعال شد؛ این ادمین اکنون دسترسی کامل مالک دارد." if current["owner_full"] else "لغو شد؛ دسترسی‌های جداگانه باقی ماندند."
+        await show(event, "✅ " + state_label + "\n\n" + text, rows)
+        return None
+
     if action == "admperm":
         admin_text, _, permission = argument.partition(":")
         if not admin_text.isdigit() or permission not in ADMIN_PERMISSION_LABELS:
@@ -7545,6 +7632,7 @@ async def dispatch_callback(event, user_id, action, argument):
         current = all_permissions.get(str(admin_id))
         if current is None:
             current = {key: True for key in ADMIN_PERMISSION_LABELS}
+            current["owner_full"] = False
         current[permission] = not bool(current.get(permission, False))
         all_permissions[str(admin_id)] = current
         save_bot_state()
@@ -7556,7 +7644,10 @@ async def dispatch_callback(event, user_id, action, argument):
         enabled = action == "adm_all_on"
         all_permissions = STATE.setdefault("admin_permissions", {})
         for admin_id in STATE.get("admins", []):
-            all_permissions[str(admin_id)] = {key: enabled for key in ADMIN_PERMISSION_LABELS}
+            current = all_permissions.get(str(admin_id)) or {}
+            current.update({key: enabled for key in ADMIN_PERMISSION_LABELS})
+            current.setdefault("owner_full", False)
+            all_permissions[str(admin_id)] = current
         save_bot_state()
         text, rows = admins_panel()
         await show(event, "✅ دسترسی‌ها برای همه ادمین‌ها به‌روزرسانی شد.\n\n" + text, rows)
@@ -7655,10 +7746,12 @@ async def bot_message_handler(event):
 
     if text.lower() == "/id":
 
-        if user_id == OWNER_ID:
+        if user_id == OWNER_ID and user_id not in TEST_MODE_USERS:
             owner_note = "✅ تو مالک ربات هستی."
         else:
             owner_note = (
+                "🧪 حالت تست: نقش مدیریتی موقتاً غیرفعال است."
+                if user_id in TEST_MODE_USERS else
                 "⚠️ تو مالک نیستی؛ اگر باید باشی، این عدد را در "
                 "Variable به نام OWNER_ID بگذار و دوباره دیپلوی کن."
             )
@@ -8485,7 +8578,8 @@ async def bot_message_handler(event):
 
             STATE["admins"].append(admin_id)
             STATE.setdefault("admin_permissions", {})[str(admin_id)] = {
-                key: True for key in ADMIN_PERMISSION_LABELS
+                **{key: True for key in ADMIN_PERMISSION_LABELS},
+                "owner_full": False
             }
             save_bot_state()
 
