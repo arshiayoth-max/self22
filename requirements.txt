@@ -1,4 +1,3 @@
-Telethon==1.45.0
-PySocks==1.7.1
-python-socks[asyncio]
-cryptography
+telethon>=1.45.0,<2
+cryptography>=42.0.0
+aiohttp>=3.9.0,<4
