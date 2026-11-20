@@ -4520,6 +4520,9 @@ def validate_purpose(user_id, purpose):
         if info is None:
             return None, "❌ این کد وجود ندارد."
 
+        if info.get("revoked"):
+            return None, "⛔ این کد توسط مالک منقضی شده است."
+
         if info.get("used_by"):
             return None, "❌ این کد قبلاً استفاده شده است."
 
@@ -5004,23 +5007,34 @@ def codes_panel():
     codes = list(STATE["codes"].items())[-15:]
 
     lines = [
-        "📜 آخرین کدها",
-        "━━━━━━━━━━━━━━━━━━"
+        "📜 مدیریت کدهای ویژه",
+        "━━━━━━━━━━━━━━━━━━",
+        "برای قطع کد و اشتراک فعال‌شده با آن، دکمه انقضای همان کد را بزن."
     ]
+    rows = []
 
     if not codes:
-        lines.append("هنوز کدی ساخته نشده است.")
+        lines.append("\nهنوز کدی ساخته نشده است.")
 
     for code, info in reversed(codes):
 
-        if info.get("used_by"):
+        if info.get("revoked"):
+            state = "⛔ منقضی‌شده توسط مالک"
+        elif info.get("used_by"):
             state = f"✅ مصرف شد ({user_label(info['used_by'])})"
         else:
             state = "🟡 مصرف‌نشده"
 
-        lines.append(f"{code} • {info['days']} روز • {state}")
+        lines.append(f"\n🎟 {code} • {info['days']} روز\n{state}")
 
-    return "\n".join(lines), [back_button()]
+        if not info.get("revoked"):
+            rows.append([Button.inline(
+                f"⛔ منقضی‌کردن {code}",
+                data=f"codeexpire:{code}".encode()
+            )])
+
+    rows.append(back_button())
+    return "\n".join(lines), rows
 
 
 # ---------------------------------------------------------
@@ -7199,6 +7213,63 @@ async def dispatch_callback(event, user_id, action, argument):
 
     if not is_owner:
         return "⛔ این بخش فقط برای مالک است."
+
+    if action == "codeexpire":
+
+        code, info = find_code(argument)
+
+        if info is None:
+            return "این کد پیدا نشد."
+
+        if info.get("revoked"):
+            text, rows = codes_panel()
+            await show(event, "این کد قبلاً منقضی شده است.\n\n" + text, rows)
+            return None
+
+        now = int(time.time())
+        info["revoked"] = True
+        info["revoked_at"] = now
+        info["revoked_by"] = int(user_id)
+
+        affected_user = info.get("used_by")
+        account_id = None
+
+        if affected_user is not None:
+            try:
+                affected_user = int(affected_user)
+                account_id = find_user_account(affected_user)
+            except (TypeError, ValueError):
+                affected_user = None
+
+        if account_id and account_id in accounts_meta:
+            meta = accounts_meta[account_id]
+            meta["expires_at"] = now
+            meta["enabled"] = False
+            save_accounts_meta()
+
+            account_obj = accounts.get(account_id)
+            if account_obj is not None:
+                account_obj.stop_tasks()
+
+            await notify(
+                affected_user,
+                "⛔ کد ویژه‌ای که با آن اشتراک فعال کرده بودی، توسط مالک منقضی شد؛ "
+                "بنابراین اشتراک و اجرای سلفت نیز متوقف شده است."
+            )
+
+        save_bot_state()
+
+        result = "✅ کد ویژه منقضی شد."
+        if account_id:
+            result += "\n⛔ اشتراک کاربر استفاده‌کننده نیز فوراً پایان یافت و سلف او متوقف شد."
+        elif affected_user is not None:
+            result += "\nاین کد استفاده شده بود، اما اکانت فعالی برای آن کاربر پیدا نشد."
+        else:
+            result += "\nاین کد هنوز استفاده نشده بود و دیگر قابل استفاده نیست."
+
+        text, rows = codes_panel()
+        await show(event, result + "\n\n" + text, rows)
+        return None
 
     if action == "invreward":
         if not is_owner:
