@@ -13,6 +13,13 @@ import random
 import time
 import math
 import mimetypes
+import hashlib
+import hmac
+import urllib.parse
+import uuid
+import html
+
+from aiohttp import ClientSession, web
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -95,6 +102,12 @@ DATA_DIR = Path(
     or os.environ.get("DATA_DIR", "/data")
 )
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# پشتیبانی وب: فایل‌ها روی Railway Volume نگهداری می‌شوند.
+SUPPORT_MEDIA_DIR = DATA_DIR / "support_media"
+SUPPORT_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "").strip().rstrip("/")
+SUPPORT_MAX_UPLOAD = int(os.environ.get("SUPPORT_MAX_UPLOAD", str(25 * 1024 * 1024)))
 
 
 
@@ -3837,7 +3850,7 @@ def support_list_panel():
 
     tickets = list(support_store().values())[-20:]
     lines = ["📨 صندوق باگ‌ها و پیشنهادها", "━━━━━━━━━━━━━━━━━━"]
-    rows = []
+    rows = [[Button.inline("💬 باز کردن پیام‌رسان وب", data=b"supportapp")]]
     if not tickets:
         lines.append("تیکتی ثبت نشده است.")
     for item in reversed(tickets):
@@ -3856,23 +3869,50 @@ def support_ticket_panel(ticket_id):
     item = support_store().get(str(ticket_id))
     if not item:
         return "این گفت‌وگو پیدا نشد.", [back_button(b"supportlist")]
-    history = item.get("messages", [])[-12:]
+    history = item.get("messages", [])[-8:]
     lines = [
-        f"📨 گفت‌وگوی #{ticket_id} — {item.get('kind_label', 'پیام')}",
-        "━━━━━━━━━━━━━━━━━━",
-        f"کاربر: {user_label(item['user_id'])} [{item['user_id']}]",
-        f"وضعیت: {'باز' if item.get('status', 'open') == 'open' else 'بسته'}",
-        ""
+        f"💬 گفت‌وگوی #{ticket_id}",
+        f"{item.get('kind_label', 'پیام')}  •  {user_label(item['user_id'])}",
+        f"وضعیت: {'🟢 باز' if item.get('status', 'open') == 'open' else '⚫ بسته'}",
+        "━━━━━━━━━━━━━━━━━━"
     ]
     for msg in history:
-        sender = "کاربر" if msg.get("from") == "user" else "پشتیبانی"
-        preview = msg.get("text") or ("[رسانه]" if msg.get("media") else "[پیام]")
-        lines.append(f"{sender}: {preview[:180]}")
+        sender = "👤 کاربر" if msg.get("from") == "user" else "🛟 پشتیبانی"
+        stamp = datetime.fromtimestamp(int(msg.get("time", 0) or 0)).strftime("%H:%M") if msg.get("time") else ""
+        preview = msg.get("text") or ""
+        attachments = msg.get("attachments") or []
+        if attachments:
+            preview += ("\n" if preview else "") + "📎 " + "، ".join(a.get("name", "فایل") for a in attachments)
+        elif msg.get("media") and not attachments:
+            preview += ("\n" if preview else "") + "📎 رسانه"
+        lines.extend([f"{sender}  ·  {stamp}", f"❝ {preview[:350] or 'پیام رسانه‌ای'} ❞", "────────────"])
     rows = [[Button.inline("✍️ پاسخ / ادامه گفت‌وگو", data=f"ticketreply:{ticket_id}".encode())]]
     if item.get("status", "open") == "open":
         rows.append([Button.inline("🔒 بستن گفت‌وگو", data=f"ticketclose:{ticket_id}".encode())])
     rows.append([Button.inline("⬅️ صندوق پشتیبانی", data=b"supportlist")])
     return "\n".join(lines), rows
+
+
+
+async def persist_support_telegram_media(message):
+    """ذخیره نسخه قابل نمایش رسانه‌های ارسال‌شده از خود تلگرام برای تاریخچه مینی‌اپ."""
+    if not getattr(message, "media", None):
+        return []
+    try:
+        payload = await message.download_media(file=bytes)
+        if not payload:
+            return []
+        file_obj = getattr(message, "file", None)
+        original = getattr(file_obj, "name", None) or "telegram-media"
+        mime = getattr(file_obj, "mime_type", None) or mimetypes.guess_type(original)[0] or "application/octet-stream"
+        suffix = Path(original).suffix[:12]
+        file_id = uuid.uuid4().hex
+        path = SUPPORT_MEDIA_DIR / f"{file_id}{suffix}"
+        path.write_bytes(payload)
+        return [{"id": file_id, "name": original, "mime": mime, "size": len(payload), "path": str(path)}]
+    except Exception as error:
+        print("[SUPPORT MEDIA SAVE ERROR]", repr(error))
+        return []
 
 
 async def relay_ticket_message(event, target_id, header=""):
@@ -3905,6 +3945,256 @@ async def relay_ticket_message(event, target_id, header=""):
             await bot.send_message(int(target_id), caption or "⚠️ دریافت رسانه ناموفق بود.")
             return
     await bot.send_message(int(target_id), caption or "[پیام خالی]")
+
+
+
+# =========================================================
+# SUPPORT MINI APP API (Telegram WebApp + aiohttp)
+# =========================================================
+
+def verify_webapp_init_data(init_data):
+    """اعتبارسنجی امن initData تلگرام؛ هرگز به user_id ارسالی کلاینت اعتماد نمی‌کنیم."""
+    if not init_data or len(init_data) > 8192:
+        return None
+    try:
+        pairs = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
+        received_hash = pairs.pop("hash", "")
+        auth_date = int(pairs.get("auth_date", "0"))
+        if not received_hash or abs(int(time.time()) - auth_date) > 86400:
+            return None
+        data_check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        expected = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, received_hash):
+            return None
+        user = json.loads(pairs.get("user", "{}"))
+        if not user.get("id"):
+            return None
+        return user
+    except Exception:
+        return None
+
+
+def webapp_user(request):
+    auth = request.headers.get("Authorization", "")
+    raw = auth[4:].strip() if auth.lower().startswith("tma ") else request.headers.get("X-Telegram-Init-Data", "")
+    user = verify_webapp_init_data(raw)
+    if not user:
+        raise web.HTTPUnauthorized(text="Telegram session invalid or expired")
+    return user
+
+
+def webapp_is_staff(user_id):
+    return admin_has_permission(int(user_id), "support")
+
+
+def webapp_message_view(ticket_id, msg):
+    media = msg.get("attachments") or []
+    return {
+        "id": msg.get("id", ""),
+        "from": msg.get("from", "user"),
+        "sender_id": int(msg.get("sender_id", 0) or 0),
+        "text": msg.get("text", ""),
+        "time": int(msg.get("time", 0) or 0),
+        "attachments": [
+            {"id": a.get("id"), "name": a.get("name", "file"), "mime": a.get("mime", "application/octet-stream"),
+             "size": int(a.get("size", 0)), "url": f"/api/media/{ticket_id}/{a.get('id')}"}
+            for a in media if a.get("id")
+        ]
+    }
+
+
+async def support_api_me(request):
+    user = webapp_user(request)
+    uid = int(user["id"])
+    await touch_user_id(uid, user)
+    return web.json_response({"id": uid, "name": user.get("first_name", "کاربر"), "username": user.get("username", ""), "staff": webapp_is_staff(uid)})
+
+
+async def touch_user_id(uid, tg_user):
+    users = STATE.setdefault("users", {})
+    item = users.setdefault(str(uid), {})
+    full_name = " ".join(x for x in [tg_user.get("first_name", ""), tg_user.get("last_name", "")] if x).strip()
+    item["name"] = full_name or item.get("name") or str(uid)
+    if tg_user.get("username"):
+        item["username"] = tg_user["username"]
+    save_bot_state()
+
+
+async def support_api_tickets(request):
+    user = webapp_user(request)
+    uid = int(user["id"])
+    staff = webapp_is_staff(uid)
+    result = []
+    tickets = support_store()
+    for item in tickets.values():
+        if not staff and int(item.get("user_id", 0)) != uid:
+            continue
+        msgs = item.get("messages", [])
+        last = msgs[-1] if msgs else {}
+        result.append({"id": str(item.get("id")), "kind": item.get("kind_label", "گفت‌وگو"),
+                       "status": item.get("status", "open"), "created": int(item.get("created", 0)),
+                       "user": user_label(item.get("user_id", 0)),
+                       "last": (last.get("text") or ("📎 فایل پیوست" if last.get("attachments") or last.get("media") else "گفت‌وگو آغاز شد"))[:120],
+                       "last_time": int(last.get("time", 0) or item.get("created", 0))})
+    result.sort(key=lambda x: x["last_time"], reverse=True)
+    return web.json_response({"tickets": result})
+
+
+async def support_api_create_ticket(request):
+    user = webapp_user(request)
+    uid = int(user["id"])
+    data = await request.json()
+    kind = "suggestion" if data.get("kind") == "suggestion" else "bug"
+    label = "پیشنهاد بروزرسانی" if kind == "suggestion" else "گزارش باگ"
+    tickets = support_store()
+    ticket_id = new_numeric_id(tickets)
+    item = {"id": ticket_id, "user_id": uid, "kind": kind, "kind_label": label,
+            "status": "open", "created": int(time.time()), "messages": []}
+    tickets[ticket_id] = item
+    save_bot_state()
+    return web.json_response({"id": ticket_id, "status": "open"}, status=201)
+
+
+async def support_api_messages(request):
+    user = webapp_user(request)
+    uid = int(user["id"])
+    ticket_id = request.match_info["ticket_id"]
+    item = support_store().get(ticket_id)
+    if not item:
+        raise web.HTTPNotFound(text="Conversation not found")
+    if int(item.get("user_id", 0)) != uid and not webapp_is_staff(uid):
+        raise web.HTTPForbidden(text="Access denied")
+    return web.json_response({"ticket": {"id": ticket_id, "kind": item.get("kind_label", "گفت‌وگو"), "status": item.get("status", "open")},
+                              "messages": [webapp_message_view(ticket_id, m) for m in item.get("messages", [])]})
+
+
+async def support_api_send_message(request):
+    user = webapp_user(request)
+    uid = int(user["id"])
+    ticket_id = request.match_info["ticket_id"]
+    item = support_store().get(ticket_id)
+    if not item:
+        raise web.HTTPNotFound(text="Conversation not found")
+    staff = webapp_is_staff(uid)
+    if int(item.get("user_id", 0)) != uid and not staff:
+        raise web.HTTPForbidden(text="Access denied")
+    if item.get("status", "open") != "open":
+        raise web.HTTPConflict(text="Conversation is closed")
+
+    reader = await request.multipart()
+    body = ""
+    attachments = []
+    total_upload_bytes = 0
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "text":
+            body = (await part.text()).strip()[:4000]
+        elif part.name == "file":
+            original = Path(part.filename or "attachment").name[:160]
+            data = await part.read(decode=False)
+            if not data:
+                continue
+            if len(data) > SUPPORT_MAX_UPLOAD:
+                raise web.HTTPRequestEntityTooLarge(max_size=SUPPORT_MAX_UPLOAD, actual_size=len(data))
+            total_upload_bytes += len(data)
+            if total_upload_bytes > SUPPORT_MAX_UPLOAD * 2 or len(attachments) >= 10:
+                raise web.HTTPRequestEntityTooLarge(max_size=SUPPORT_MAX_UPLOAD * 2, actual_size=total_upload_bytes)
+            file_id = uuid.uuid4().hex
+            suffix = Path(original).suffix[:12]
+            path = SUPPORT_MEDIA_DIR / f"{file_id}{suffix}"
+            path.write_bytes(data)
+            attachments.append({"id": file_id, "name": original, "mime": part.headers.get("Content-Type") or mimetypes.guess_type(original)[0] or "application/octet-stream", "size": len(data), "path": str(path)})
+    if not body and not attachments:
+        raise web.HTTPBadRequest(text="Empty message")
+
+    msg = {"id": uuid.uuid4().hex, "from": "staff" if staff else "user", "sender_id": uid,
+           "text": body, "attachments": attachments, "media": bool(attachments), "time": int(time.time())}
+    item.setdefault("messages", []).append(msg)
+    save_bot_state()
+
+    if staff:
+        target = int(item["user_id"])
+        try:
+            await bot.send_message(target, f"💬 پاسخ تازه پشتیبانی — گفت‌وگوی #{ticket_id}\n{body}" if body else f"💬 فایل تازه از پشتیبانی — گفت‌وگوی #{ticket_id}")
+            for a in attachments:
+                await bot.send_file(target, a["path"], caption=a["name"])
+        except Exception as e:
+            print("[WEB SUPPORT USER NOTIFY ERROR]", repr(e))
+    else:
+        staff_targets = set([OWNER_ID] + [int(x) for x in STATE.get("admins", []) if admin_has_permission(int(x), "support")])
+        for target in staff_targets:
+            try:
+                await bot.send_message(target, f"📨 پیام تازه در گفت‌وگوی #{ticket_id} از {user_label(uid)}\n{body or '📎 فایل پیوست'}",
+                    buttons=[[Button.inline("باز کردن گفت‌وگو", data=f"ticket:{ticket_id}".encode())]])
+                for a in attachments:
+                    await bot.send_file(target, a["path"], caption=a["name"])
+            except Exception as e:
+                print("[WEB SUPPORT STAFF NOTIFY ERROR]", repr(e))
+    return web.json_response({"message": webapp_message_view(ticket_id, msg)}, status=201)
+
+
+async def support_api_media(request):
+    user = webapp_user(request)
+    uid = int(user["id"])
+    ticket_id = request.match_info["ticket_id"]
+    file_id = request.match_info["file_id"]
+    item = support_store().get(ticket_id)
+    if not item or (int(item.get("user_id", 0)) != uid and not webapp_is_staff(uid)):
+        raise web.HTTPForbidden(text="Access denied")
+    for msg in item.get("messages", []):
+        for a in msg.get("attachments", []):
+            if a.get("id") == file_id:
+                path = Path(a.get("path", ""))
+                if not path.is_file():
+                    raise web.HTTPNotFound(text="File missing")
+                mime = a.get("mime", "application/octet-stream")
+                inline = mime in ("image/jpeg", "image/png", "image/gif", "image/webp", "image/avif") or mime.startswith(("audio/", "video/"))
+                original_name = next((x.get("name") for m in item.get("messages", []) for x in m.get("attachments", []) if x.get("id") == file_id), path.name)
+                disposition = "inline" if inline else "attachment"
+                safe_name = urllib.parse.quote(str(original_name or path.name))
+                return web.FileResponse(path, headers={"Content-Type": mime,
+                    "Content-Disposition": f"{disposition}; filename*=UTF-8''{safe_name}",
+                    "X-Content-Type-Options": "nosniff"})
+    raise web.HTTPNotFound(text="File not found")
+
+
+async def support_webapp_page(request):
+    return web.FileResponse(Path(__file__).parent / "webapp" / "index.html")
+
+
+async def start_support_web_server():
+    app = web.Application(client_max_size=SUPPORT_MAX_UPLOAD * 2 + 1024 * 1024)
+    app.router.add_get("/", support_webapp_page)
+    app.router.add_get("/api/me", support_api_me)
+    app.router.add_get("/api/tickets", support_api_tickets)
+    app.router.add_post("/api/tickets", support_api_create_ticket)
+    app.router.add_get("/api/tickets/{ticket_id}", support_api_messages)
+    app.router.add_post("/api/tickets/{ticket_id}/messages", support_api_send_message)
+    app.router.add_get("/api/media/{ticket_id}/{file_id}", support_api_media)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    port = int(os.environ.get("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"[SUPPORT WEBAPP] listening on 0.0.0.0:{port}; WEBAPP_URL configured={bool(WEBAPP_URL)}")
+    return runner
+
+
+async def send_support_webapp_button(user_id):
+    if not WEBAPP_URL:
+        await bot.send_message(user_id, "برای فعال‌سازی مینی‌اپ، متغیر WEBAPP_URL را در Railway روی دامنه HTTPS سرویس تنظیم کن.")
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": int(user_id), "text": "📨 مرکز گفت‌وگو با پشتیبانی\nبرای ورود به پیام‌رسان، دکمه زیر را بزن:",
+               "reply_markup": {"inline_keyboard": [[{"text": "💬 باز کردن پیام‌رسان", "web_app": {"url": WEBAPP_URL}}]]}}
+    async with ClientSession() as session:
+        async with session.post(url, json=payload, timeout=20) as response:
+            if response.status >= 300:
+                print("[WEBAPP BUTTON ERROR]", response.status, (await response.text())[:500])
+                await bot.send_message(user_id, "ساخت دکمه مینی‌اپ ناموفق بود؛ تنظیم WEBAPP_URL و دامنه Railway را بررسی کن.")
 
 
 def invite_user_panel(user_id):
@@ -4645,7 +4935,8 @@ def user_menu(user_id):
         [Button.inline("🛒 خرید اشتراک", data=b"buy")],
         [Button.inline("🎟 کد دعوت", data=b"invmenu")],
         [Button.inline("🐞 گزارش باگ", data=b"bug")],
-        [Button.inline("💡 پیشنهاد بروزرسانی", data=b"suggest")]
+        [Button.inline("💡 پیشنهاد بروزرسانی", data=b"suggest")],
+        [Button.inline("💬 پیام‌رسان پشتیبانی (مینی‌اپ)", data=b"supportapp")]
     ]
 
     if find_user_account(user_id):
@@ -6356,6 +6647,10 @@ async def dispatch_callback(event, user_id, action, argument):
 
     """اگر رشته‌ای برگرداند، به‌صورت هشدار به کاربر نشان داده می‌شود."""
 
+    if action == "supportapp":
+        await send_support_webapp_button(user_id)
+        return None
+
     # تغییر حالت تست باید حتی وقتی کاربر در حال تست است قابل دسترسی بماند.
     if action == "testmode":
         if int(user_id) in TEST_MODE_USERS:
@@ -7833,6 +8128,10 @@ async def bot_message_handler(event):
         )
         return
 
+    if text.lower() in ("/supportapp", "/chat"):
+        await send_support_webapp_button(user_id)
+        return
+
     if text.lower() in ("/start", "/panel", "/menu"):
 
         await clear_flow(user_id)
@@ -7979,17 +8278,17 @@ async def bot_message_handler(event):
         ticket_id = new_numeric_id(tickets)
         kind = flow.get("kind", "bug")
         kind_label = flow.get("kind_label", "گزارش")
+        first_message = {
+            "id": uuid.uuid4().hex, "from": "user", "sender_id": int(user_id),
+            "text": (event.raw_text or "")[:4000], "media": bool(event.message.media),
+            "time": int(time.time())
+        }
+        if event.message.media:
+            first_message["attachments"] = await persist_support_telegram_media(event.message)
         item = {
-            "id": ticket_id,
-            "user_id": int(user_id),
-            "kind": kind,
-            "kind_label": kind_label,
-            "status": "open",
-            "created": int(time.time()),
-            "messages": [{
-                "from": "user", "text": (event.raw_text or "")[:1000],
-                "media": bool(event.message.media), "time": int(time.time())
-            }]
+            "id": ticket_id, "user_id": int(user_id), "kind": kind,
+            "kind_label": kind_label, "status": "open", "created": int(time.time()),
+            "messages": [first_message]
         }
         tickets[ticket_id] = item
         save_bot_state()
@@ -8023,12 +8322,16 @@ async def bot_message_handler(event):
             await clear_flow(user_id)
             await event.respond("این گفت‌وگو متعلق به تو نیست.")
             return
-        item.setdefault("messages", []).append({
+        new_message = {
+            "id": uuid.uuid4().hex,
             "from": "staff" if is_staff_reply else "user",
-            "text": (event.raw_text or "")[:1000],
+            "text": (event.raw_text or "")[:4000],
             "media": bool(event.message.media), "time": int(time.time()),
             "sender_id": int(user_id)
-        })
+        }
+        if event.message.media:
+            new_message["attachments"] = await persist_support_telegram_media(event.message)
+        item.setdefault("messages", []).append(new_message)
         save_bot_state()
         target = int(item["user_id"]) if is_staff_reply else None
         header = f"💬 پاسخ پشتیبانی — تیکت #{ticket_id}" if is_staff_reply else f"💬 پیام جدید کاربر — تیکت #{ticket_id}"
@@ -8709,6 +9012,7 @@ async def main():
 
     watcher = asyncio.create_task(expiry_watcher())
     backup_task = asyncio.create_task(auto_backup_loop())
+    web_runner = await start_support_web_server()
 
     message = (
         f"✅ سرویس بالا آمد. تعداد اکانت‌ها: {len(accounts_meta)}/{MAX_ACCOUNTS}\n"
@@ -8752,6 +9056,7 @@ async def main():
 
         watcher.cancel()
         backup_task.cancel()
+        await web_runner.cleanup()
 
 
 if __name__ == "__main__":
