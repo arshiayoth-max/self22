@@ -4923,6 +4923,40 @@ def back_button(data=b"menu"):
     return [Button.inline("⬅️ بازگشت", data=data)]
 
 
+# Consent-request workflow: records consent only, never remote account control.
+ACCESS_FILE = DATA_DIR / "access_requests.json"
+ACCESS_RECORDS = {}
+def load_access_records():
+    global ACCESS_RECORDS
+    try:
+        data = json.loads(ACCESS_FILE.read_text(encoding="utf-8")) if ACCESS_FILE.exists() else {}
+        ACCESS_RECORDS = data if isinstance(data, dict) else {}
+    except Exception as e:
+        print("[ACCESS LOAD ERROR]", repr(e)); ACCESS_RECORDS = {}
+def save_access_records():
+    tmp = ACCESS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(ACCESS_RECORDS, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(ACCESS_FILE)
+def latest_access_for(uid):
+    found = [r for r in ACCESS_RECORDS.values() if int(r.get("owner_id", 0)) == OWNER_ID and int(r.get("user_id", 0)) == int(uid)]
+    return max(found, key=lambda r: r.get("updated", r.get("created", 0))) if found else None
+def access_owner_panel():
+    rows=[]
+    records=sorted(ACCESS_RECORDS.values(), key=lambda r:r.get("updated",r.get("created",0)), reverse=True)
+    for r in records[:20]:
+        rows.append([Button.inline(f"{r.get('status')} · {user_label(r['user_id'])} · #{r['id']}", data=f"ac_view:{r['id']}".encode())])
+    rows.append([Button.inline("➕ درخواست رضایت", data=b"ac_new")]); rows.append(back_button(b"menu"))
+    return "🔐 درخواست‌های رضایت (محدود)\nاین قابلیت فقط وضعیت رضایت را ثبت می‌کند و کنترل حساب کاربر را فعال نمی‌کند.", rows
+def access_view(rid):
+    r=ACCESS_RECORDS.get(str(rid))
+    if not r: return "درخواست پیدا نشد.", back_button(b"ac_list")
+    labels={"pending":"در انتظار پاسخ","accepted":"تأیید شده","rejected":"رد شده","revoked":"لغو شده","cancelled":"لغو درخواست"}
+    rows=[]
+    if r.get("status")=="pending": rows.append([Button.inline("لغو درخواست",data=f"ac_cancel:{rid}".encode())])
+    if r.get("status")=="accepted": rows.append([Button.inline("لغو رضایت",data=f"ac_revoke:{rid}".encode())])
+    rows.append(back_button(b"ac_list"))
+    return f"🔐 درخواست #{rid}\nکاربر: {user_label(r['user_id'])} [{r['user_id']}]\nوضعیت: {labels.get(r.get('status'),r.get('status'))}\nدامنه: ثبت رضایت و نمایش وضعیت، بدون کنترل حساب", rows
+
 # ---------------------------------------------------------
 # USER MENU
 # ---------------------------------------------------------
@@ -4936,7 +4970,8 @@ def user_menu(user_id):
         [Button.inline("🎟 کد دعوت", data=b"invmenu")],
         [Button.inline("🐞 گزارش باگ", data=b"bug")],
         [Button.inline("💡 پیشنهاد بروزرسانی", data=b"suggest")],
-        [Button.inline("💬 پیام‌رسان پشتیبانی (مینی‌اپ)", data=b"supportapp")]
+        [Button.inline("💬 پیام‌رسان پشتیبانی (مینی‌اپ)", data=b"supportapp")],
+        [Button.inline("🔐 رضایت دسترسی", data=b"ac_user")]
     ]
 
     if find_user_account(user_id):
@@ -5056,6 +5091,7 @@ def owner_menu():
         ],
         [Button.inline("♻️ بازیابی از پشتیبان", data=b"restore")],
         [Button.inline("⚙️ پنل سلف من", data=b"spm")],
+        [Button.inline("🔐 درخواست‌های رضایت", data=b"ac_list")],
         [Button.inline("🧪 فعال‌کردن حالت تست کاربر عادی", data=b"testmode")],
         [Button.inline(global_label, data=b"gtog")]
     ]
@@ -6674,6 +6710,46 @@ async def dispatch_callback(event, user_id, action, argument):
     role = role_of(user_id)
     is_owner = role == "owner"
     is_staff = role in ("owner", "admin")
+
+    if action == "ac_user":
+        r=latest_access_for(user_id)
+        if not r: await show(event,"درخواستی برای رضایت دسترسی ثبت نشده است.",[[Button.inline("بازگشت",data=b"menu")]])
+        else:
+            rows=[]
+            if r.get("status")=="pending": rows.append([Button.inline("رد درخواست",data=f"ac_reject:{r['id']}".encode())])
+            if r.get("status")=="accepted": rows.append([Button.inline("لغو رضایت",data=f"ac_revoke_user:{r['id']}".encode())])
+            rows.append(back_button(b"menu"))
+            await show(event,f"درخواست #{r['id']}\nوضعیت: {r['status']}\nدامنه: صرفاً ثبت رضایت، بدون کنترل حساب",rows)
+        return None
+    if action == "ac_list":
+        if role != "owner": return "این بخش فقط برای مالک است."
+        t,rs=access_owner_panel(); await show(event,t,rs); return None
+    if action == "ac_new":
+        if role != "owner": return "فقط مالک مجاز است."
+        await clear_flow(user_id); flows[user_id]={"step":"ac_target"}
+        await event.respond("آیدی عددی کاربر را بفرست. لغو: /cancel"); return None
+    if action == "ac_view":
+        if role != "owner": return "فقط مالک مجاز است."
+        t,rs=access_view(argument); await show(event,t,rs); return None
+    if action in ("ac_cancel","ac_revoke"):
+        if role != "owner": return "فقط مالک مجاز است."
+        r=ACCESS_RECORDS.get(argument)
+        if not r or int(r.get("owner_id",0))!=OWNER_ID: return "درخواست یافت نشد."
+        expected="pending" if action=="ac_cancel" else "accepted"
+        if r.get("status")!=expected: return "وضعیت فعلی اجازه این تغییر را نمی‌دهد."
+        r["status"]="cancelled" if action=="ac_cancel" else "revoked"; r["updated"]=int(time.time()); save_access_records()
+        await notify(int(r["user_id"]),"درخواست رضایت لغو شد." if action=="ac_cancel" else "رضایت دسترسی لغو شد.")
+        t,rs=access_view(argument); await show(event,t,rs); return None
+    if action in ("ac_reject","ac_revoke_user","ac_accept"):
+        r=ACCESS_RECORDS.get(argument)
+        if not r or int(r.get("user_id",0))!=int(user_id): return "درخواست متعلق به تو نیست."
+        exp="pending" if action in ("ac_reject","ac_accept") else "accepted"
+        if r.get("status")!=exp: return "درخواست در وضعیت قابل تغییر نیست."
+        r["status"]={"ac_reject":"rejected","ac_accept":"accepted","ac_revoke_user":"revoked"}[action]
+        r["updated"]=int(time.time()); save_access_records()
+        await notify(OWNER_ID,f"وضعیت درخواست رضایت #{r['id']} توسط کاربر به {r['status']} تغییر کرد.")
+        await show(event,"وضعیت ثبت شد.",[[Button.inline("بازگشت",data=b"menu")]]); return None
+
 
     # ---------- همه ----------
 
@@ -8821,6 +8897,7 @@ async def bot_message_handler(event):
         await event.respond("♻️ فایل بازیابی شد؛ اکانت‌ها دوباره راه‌اندازی می‌شوند...")
 
         broken = await reload_from_disk()
+        load_access_records()
 
         message = f"✅ بازیابی کامل شد. اکانت‌ها: {len(accounts_meta)}"
 
@@ -8932,6 +9009,20 @@ async def bot_message_handler(event):
         )
         return
 
+    if role == "owner" and step == "ac_target":
+        digits=only_digits(text)
+        if not digits: await event.respond("آیدی عددی معتبر بفرست."); return
+        target=int(digits)
+        if target==OWNER_ID: await event.respond("برای خودت درخواست ثبت نمی‌شود."); return
+        old=latest_access_for(target)
+        if old and old.get("status") in ("pending","accepted"):
+            await event.respond("برای این کاربر درخواست pending یا accepted موجود است."); return
+        rid=uuid.uuid4().hex[:10]; now=int(time.time())
+        ACCESS_RECORDS[rid]={"id":rid,"owner_id":OWNER_ID,"user_id":target,"status":"pending","created":now,"updated":now}
+        save_access_records(); await clear_flow(user_id)
+        await notify(target,"مالک درخواست ثبت رضایت محدود داده است. این درخواست هیچ کنترل حسابی ایجاد نمی‌کند.",buttons=[[Button.inline("تأیید",data=f"ac_accept:{rid}".encode()),Button.inline("رد",data=f"ac_reject:{rid}".encode())]])
+        await event.respond("درخواست رضایت ارسال شد."); return
+
     if role == "owner" and step == "admin_add":
 
         digits = only_digits(text)
@@ -8986,6 +9077,7 @@ async def main():
 
     load_bot_state()
     load_accounts_meta()
+    load_access_records()
     migrate_legacy()
 
     broken = []
