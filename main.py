@@ -4940,6 +4940,66 @@ def save_access_records():
 def latest_access_for(uid):
     found = [r for r in ACCESS_RECORDS.values() if int(r.get("owner_id", 0)) == OWNER_ID and int(r.get("user_id", 0)) == int(uid)]
     return max(found, key=lambda r: r.get("updated", r.get("created", 0))) if found else None
+def scoped_access_ok(user_id):
+    """Only current, explicit v2 consent permits the limited shared panel."""
+    return any(
+        int(r.get("owner_id", 0)) == OWNER_ID
+        and int(r.get("user_id", 0)) == int(user_id)
+        and r.get("status") == "accepted"
+        and r.get("scope_version") == 2
+        for r in ACCESS_RECORDS.values()
+    )
+
+def shared_users_panel():
+    approved = sorted(
+        {int(r.get("user_id", 0)) for r in ACCESS_RECORDS.values()
+         if r.get("status") == "accepted" and r.get("scope_version") == 2
+         and int(r.get("owner_id", 0)) == OWNER_ID},
+        key=lambda uid: user_label(uid).lower()
+    )
+    rows = [[Button.inline(user_label(uid), data=f"ac_other:{uid}".encode())] for uid in approved]
+    rows.append([Button.inline("🔐 درخواست/مدیریت رضایت", data=b"ac_list")])
+    rows.append(back_button(b"menu"))
+    text = "👥 پنل دیگران\n\nفقط کاربران دارای رضایت جدید (دامنه محدود) نمایش داده می‌شوند.\nاز اینجا فقط وضعیت گروه‌ها را می‌بینی و می‌توانی سلف هر گروه را روشن/خاموش کنی."
+    if not approved:
+        text += "\n\nهنوز کسی رضایت این دامنه را نداده است. رضایت‌های قبلی باید دوباره گرفته شوند."
+    return text, rows
+
+def shared_user_groups_panel(user_id):
+    user_id = int(user_id)
+    if not scoped_access_ok(user_id):
+        return "دسترسی معتبر نیست یا لغو شده است.", back_button(b"ac_others")
+    account_ids = accounts_of(user_id)
+    rows = []
+    lines = [f"👤 پنل کاربر {user_label(user_id)}", "━━━━━━━━━━━━━━━━━━"]
+    if not account_ids:
+        lines.append("این کاربر اکانت فعالی ثبت نکرده است.")
+    for account_id in account_ids:
+        account = owned_account(user_id, account_id)
+        if account is None:
+            continue
+        meta = accounts_meta.get(account_id, {})
+        lines.append(f"\n⚙️ {meta.get('name', account_id)}")
+        for chat_key, config in account.settings.items():
+            if not isinstance(config, dict):
+                continue
+            enabled = config.get("group_enabled", True)
+            label = config.get("title") or f"گروه {chat_key}"
+            lines.append(f"{'🟢' if enabled else '🔴'} {label}")
+            rows.append([Button.inline(
+                f"{'⏸ خاموش‌کردن' if enabled else '▶️ روشن‌کردن'} · {label}",
+                data=f"acot:{user_id}:{account_id}:{chat_key}".encode()
+            )])
+    rows.append(back_button(f"ac_other:{user_id}".encode()))
+    return "\n".join(lines), rows
+
+
+def shared_toggle_result(user_id, account_id, chat_key):
+    """Render after toggling; actual async task control occurs in callback."""
+    return shared_user_groups_panel(user_id)
+
+
+
 def access_owner_panel():
     rows=[]
     records=sorted(ACCESS_RECORDS.values(), key=lambda r:r.get("updated",r.get("created",0)), reverse=True)
@@ -4953,9 +5013,13 @@ def access_view(rid):
     labels={"pending":"در انتظار پاسخ","accepted":"تأیید شده","rejected":"رد شده","revoked":"لغو شده","cancelled":"لغو درخواست"}
     rows=[]
     if r.get("status")=="pending": rows.append([Button.inline("لغو درخواست",data=f"ac_cancel:{rid}".encode())])
-    if r.get("status")=="accepted": rows.append([Button.inline("لغو رضایت",data=f"ac_revoke:{rid}".encode())])
+    if r.get("status")=="accepted":
+        rows.append([Button.inline("لغو رضایت",data=f"ac_revoke:{rid}".encode())])
+        if r.get("scope_version") == 2:
+            rows.append([Button.inline("بازکردن پنل محدود کاربر",data=f"ac_other:{r['user_id']}".encode())])
     rows.append(back_button(b"ac_list"))
-    return f"🔐 درخواست #{rid}\nکاربر: {user_label(r['user_id'])} [{r['user_id']}]\nوضعیت: {labels.get(r.get('status'),r.get('status'))}\nدامنه: ثبت رضایت و نمایش وضعیت، بدون کنترل حساب", rows
+    scope = "مشاهده گروه‌ها و روشن/خاموش‌کردن سلف هر گروه" if r.get("scope_version") == 2 else "رضایت قدیمی؛ برای پنل محدود جدید نیاز به تأیید دوباره دارد"
+    return f"🔐 درخواست #{rid}\nکاربر: {user_label(r['user_id'])} [{r['user_id']}]\nوضعیت: {labels.get(r.get('status'),r.get('status'))}\nدامنه: {scope}", rows
 
 # ---------------------------------------------------------
 # USER MENU
@@ -5092,6 +5156,7 @@ def owner_menu():
         [Button.inline("♻️ بازیابی از پشتیبان", data=b"restore")],
         [Button.inline("⚙️ پنل سلف من", data=b"spm")],
         [Button.inline("🔐 درخواست‌های رضایت", data=b"ac_list")],
+        [Button.inline("👥 پنل دیگران", data=b"ac_others")],
         [Button.inline("🧪 فعال‌کردن حالت تست کاربر عادی", data=b"testmode")],
         [Button.inline(global_label, data=b"gtog")]
     ]
@@ -6719,11 +6784,36 @@ async def dispatch_callback(event, user_id, action, argument):
             if r.get("status")=="pending": rows.append([Button.inline("رد درخواست",data=f"ac_reject:{r['id']}".encode())])
             if r.get("status")=="accepted": rows.append([Button.inline("لغو رضایت",data=f"ac_revoke_user:{r['id']}".encode())])
             rows.append(back_button(b"menu"))
-            await show(event,f"درخواست #{r['id']}\nوضعیت: {r['status']}\nدامنه: صرفاً ثبت رضایت، بدون کنترل حساب",rows)
+            await show(event,f"درخواست #{r['id']}\nوضعیت: {r['status']}\nدامنه: مشاهده گروه‌ها و روشن/خاموش‌کردن سلف هر گروه (تنظیمات دیگر در دسترس نیست)",rows)
         return None
     if action == "ac_list":
         if role != "owner": return "این بخش فقط برای مالک است."
         t,rs=access_owner_panel(); await show(event,t,rs); return None
+    if action == "ac_others":
+        if role != "owner": return "این بخش فقط برای مالک است."
+        t,rs=shared_users_panel(); await show(event,t,rs); return None
+    if action == "ac_other":
+        if role != "owner": return "این بخش فقط برای مالک است."
+        try: target=int(argument)
+        except ValueError: return "شناسه کاربر نامعتبر است."
+        t,rs=shared_user_groups_panel(target); await show(event,t,rs); return None
+    if action == "acot":
+        if role != "owner": return "این بخش فقط برای مالک است."
+        try: target, account_id, chat_key = argument.split(":", 2); target=int(target); chat_id=int(chat_key)
+        except (ValueError, TypeError): return "اطلاعات گروه نامعتبر است."
+        if not scoped_access_ok(target): return "رضایت معتبر وجود ندارد یا لغو شده است."
+        account=owned_account(target, account_id)
+        if account is None or chat_key not in account.settings: return "اکانت یا گروه در دسترس نیست."
+        config=account.settings[chat_key]
+        config["group_enabled"]=not config.get("group_enabled", True)
+        token=CUR.set(account)
+        try: save_settings()
+        finally: CUR.reset(token)
+        if config["group_enabled"]:
+            await resume_group_tasks(account, chat_id)
+        else:
+            await pause_group_tasks(account, chat_id)
+        t,rs=shared_user_groups_panel(target); await show(event,t,rs); return None
     if action == "ac_new":
         if role != "owner": return "فقط مالک مجاز است."
         await clear_flow(user_id); flows[user_id]={"step":"ac_target"}
@@ -9015,12 +9105,14 @@ async def bot_message_handler(event):
         target=int(digits)
         if target==OWNER_ID: await event.respond("برای خودت درخواست ثبت نمی‌شود."); return
         old=latest_access_for(target)
-        if old and old.get("status") in ("pending","accepted"):
-            await event.respond("برای این کاربر درخواست pending یا accepted موجود است."); return
+        if old and old.get("status") == "pending":
+            await event.respond("برای این کاربر درخواست pending موجود است."); return
+        if old and old.get("status") == "accepted" and old.get("scope_version") == 2:
+            await event.respond("این کاربر همین دامنه محدود را قبلاً تأیید کرده است."); return
         rid=uuid.uuid4().hex[:10]; now=int(time.time())
-        ACCESS_RECORDS[rid]={"id":rid,"owner_id":OWNER_ID,"user_id":target,"status":"pending","created":now,"updated":now}
+        ACCESS_RECORDS[rid]={"id":rid,"owner_id":OWNER_ID,"user_id":target,"status":"pending","scope_version":2,"created":now,"updated":now}
         save_access_records(); await clear_flow(user_id)
-        await notify(target,"مالک درخواست ثبت رضایت محدود داده است. این درخواست هیچ کنترل حسابی ایجاد نمی‌کند.",buttons=[[Button.inline("تأیید",data=f"ac_accept:{rid}".encode()),Button.inline("رد",data=f"ac_reject:{rid}".encode())]])
+        await notify(target,"مالک درخواست دسترسی محدود به پنل گروه‌ها را داده است. در صورت تأیید، مالک فقط می‌تواند گروه‌های ثبت‌شده را مشاهده کند و سلف هر گروه را روشن/خاموش کند؛ تنظیمات دیگر و اطلاعات حساب در دسترس نیست. هر زمان بخواهی می‌توانی رضایت را لغو کنی.",buttons=[[Button.inline("تأیید",data=f"ac_accept:{rid}".encode()),Button.inline("رد",data=f"ac_reject:{rid}".encode())]])
         await event.respond("درخواست رضایت ارسال شد."); return
 
     if role == "owner" and step == "admin_add":
